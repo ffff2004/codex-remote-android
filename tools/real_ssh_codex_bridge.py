@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Expose the installed Codex app-server through a local SSH test endpoint.
+"""Expose the installed Codex app-server daemon through a local SSH test endpoint.
 
-This is an integration harness, not an app-server double. Every JSONL byte is
-forwarded to the real Codex CLI process so Android exercises the production
+This is an integration harness, not an app-server double. The bridge runs the
+real Codex CLI: `codex app-server daemon start` for the lifecycle line and
+`codex app-server proxy --sock <socketPath>` for the WebSocket-over-stdio byte
+stream that the Android client consumes, so Android exercises the production
 protocol, account, model catalog, history, and agent runtime.
 """
 
@@ -13,6 +15,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -89,43 +92,53 @@ def load_or_create_host_key(path: Path) -> paramiko.RSAKey:
     return key
 
 
-def resolve_codex_process(node: Path, codex_js: Path, *arguments: str) -> list[str]:
-    if not node.is_file():
-        raise FileNotFoundError(f"Node executable not found: {node}")
-    if not codex_js.is_file():
-        raise FileNotFoundError(f"Codex CLI entrypoint not found: {codex_js}")
-    return [str(node), str(codex_js), *arguments]
+def resolve_codex(value: str) -> str:
+    """Resolve `--codex` to an executable path (POSIX; no Node/npm assumptions)."""
+    expanded = Path(value).expanduser()
+    if os.path.sep in value or (os.path.altsep and os.path.altsep in value):
+        if not expanded.is_file():
+            raise FileNotFoundError(f"Codex executable not found: {expanded}")
+        return str(expanded)
+    resolved = shutil.which(value)
+    if resolved is None:
+        raise FileNotFoundError(f"Codex executable not found on PATH: {value}")
+    return resolved
 
 
-def handle_probe(
-    channel: paramiko.Channel,
-    command: str,
-    node: Path,
-    codex_js: Path,
-    events: EventLog,
-) -> bool:
-    if "__CODEX_POSIX__" in command:
-        channel.send_stderr(b"Windows integration bridge\n")
+def parse_exec_command(command: str) -> list[str]:
+    """Reverse the client's `exec "<shell>" -lc '<inner>'` POSIX quoting."""
+    try:
+        outer = shlex.split(command)
+        inner = outer[outer.index("-lc") + 1]
+    except (ValueError, IndexError):
+        return []
+    try:
+        return shlex.split(inner)
+    except ValueError:
+        return []
+
+
+def bridge_daemon_start(channel: paramiko.Channel, codex: str, events: EventLog) -> None:
+    try:
+        completed = subprocess.run(
+            [codex, "app-server", "daemon", "start"],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        channel.send_stderr(b"codex app-server daemon start timed out\n")
         channel.send_exit_status(1)
         channel.close()
-        return True
-    if "codex --version" not in command:
-        return False
-
-    completed = subprocess.run(
-        resolve_codex_process(node, codex_js, "--version"),
-        capture_output=True,
-        check=False,
-        timeout=20,
-    )
+        events.write("daemon_start", exit_status=1, detail="timeout")
+        return
     if completed.stdout:
         channel.sendall(completed.stdout)
     if completed.stderr:
         channel.send_stderr(completed.stderr)
     channel.send_exit_status(completed.returncode)
     channel.close()
-    events.write("codex_version", exit_status=completed.returncode)
-    return True
+    events.write("daemon_start", exit_status=completed.returncode)
 
 
 def pump_channel_to_process(channel: paramiko.Channel, process: subprocess.Popen[bytes]) -> None:
@@ -162,20 +175,20 @@ def pump_process_stream(stream: Any, sender: Any) -> None:
         pass
 
 
-def bridge_app_server(
+def bridge_proxy(
     channel: paramiko.Channel,
-    node: Path,
-    codex_js: Path,
+    codex: str,
+    socket_path: str,
     events: EventLog,
 ) -> None:
     process = subprocess.Popen(
-        resolve_codex_process(node, codex_js, "app-server", "--listen", "stdio://"),
+        [codex, "app-server", "proxy", "--sock", socket_path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
     )
-    events.write("app_server_started", pid=process.pid)
+    events.write("proxy_started", pid=process.pid, socket_path=socket_path)
     channel.settimeout(1.0)
     workers = [threading.Thread(target=pump_channel_to_process, args=(channel, process), daemon=True)]
     if process.stdout is not None:
@@ -186,7 +199,7 @@ def bridge_app_server(
         worker.start()
 
     try:
-        return_code = process.wait()
+        process.wait()
     finally:
         if process.poll() is None:
             process.terminate()
@@ -199,14 +212,13 @@ def bridge_app_server(
         except (EOFError, OSError, socket.error):
             pass
         channel.close()
-        events.write("app_server_stopped", pid=process.pid, exit_status=process.returncode)
+        events.write("proxy_stopped", pid=process.pid, exit_status=process.returncode)
 
 
 def handle_channel(
     channel: paramiko.Channel,
     server: BridgeSshServer,
-    node: Path,
-    codex_js: Path,
+    codex: str,
     events: EventLog,
 ) -> None:
     command = server.wait_for_command(channel.get_id(), 15)
@@ -216,12 +228,24 @@ def handle_channel(
         channel.close()
         return
     # Let Paramiko send CHANNEL_SUCCESS for the exec request before a fast
-    # probe writes its exit status and closes the channel.
+    # lifecycle command writes its exit status and closes the channel.
     time.sleep(0.05)
-    if handle_probe(channel, command, node, codex_js, events):
+    arguments = parse_exec_command(command)
+    if arguments[:5] == ["exec", "codex", "app-server", "daemon", "start"]:
+        bridge_daemon_start(channel, codex, events)
         return
-    if "codex app-server --listen stdio://" in command:
-        bridge_app_server(channel, node, codex_js, events)
+    if arguments[:4] == ["exec", "codex", "app-server", "proxy"]:
+        socket_path = None
+        if "--sock" in arguments:
+            index = arguments.index("--sock")
+            if index + 1 < len(arguments):
+                socket_path = arguments[index + 1]
+        if socket_path:
+            bridge_proxy(channel, codex, socket_path, events)
+            return
+        channel.send_stderr(b"proxy command is missing --sock\n")
+        channel.send_exit_status(2)
+        channel.close()
         return
     channel.send_stderr(b"Unsupported integration command\n")
     channel.send_exit_status(127)
@@ -234,8 +258,7 @@ def handle_client(
     host_key: paramiko.PKey,
     username: str,
     password: str,
-    node: Path,
-    codex_js: Path,
+    codex: str,
     events: EventLog,
 ) -> None:
     events.write("connection_open", peer=f"{peer[0]}:{peer[1]}")
@@ -252,7 +275,7 @@ def handle_client(
                 continue
             worker = threading.Thread(
                 target=handle_channel,
-                args=(channel, server, node, codex_js, events),
+                args=(channel, server, codex, events),
                 daemon=True,
             )
             worker.start()
@@ -266,21 +289,16 @@ def handle_client(
 
 
 def main() -> None:
-    app_data = Path(os.environ.get("APPDATA", ""))
-    default_codex_js = app_data / "npm" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-    default_node = Path(shutil.which("node.exe") or shutil.which("node") or "node.exe")
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=22223)
     parser.add_argument("--username", default="codex-real")
     parser.add_argument("--password", default="codex-real")
     parser.add_argument("--state-dir", type=Path, required=True)
-    parser.add_argument("--node", type=Path, default=default_node)
-    parser.add_argument("--codex-js", type=Path, default=default_codex_js)
+    parser.add_argument("--codex", default="codex", help="Codex executable name or path")
     args = parser.parse_args()
 
-    resolve_codex_process(args.node, args.codex_js, "--version")
+    codex = resolve_codex(args.codex)
     args.state_dir.mkdir(parents=True, exist_ok=True)
     events_path = args.state_dir / "events.jsonl"
     events_path.write_text("", encoding="utf-8")
@@ -297,7 +315,7 @@ def main() -> None:
         port=args.port,
         username=args.username,
         fingerprint=host_fingerprint(host_key),
-        codex_js=str(args.codex_js),
+        codex=codex,
     )
     try:
         while True:
@@ -310,8 +328,7 @@ def main() -> None:
                     host_key,
                     args.username,
                     args.password,
-                    args.node,
-                    args.codex_js,
+                    codex,
                     events,
                 ),
                 daemon=True,
