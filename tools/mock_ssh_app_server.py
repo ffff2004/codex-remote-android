@@ -84,11 +84,231 @@ class MockSshServer(paramiko.ServerInterface):
         return True
 
 
-class MockAppServer:
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MOCK_SOCKET_PATH = "/run/user/1000/codex.sock"
+MOCK_CLI_VERSION = "0.0.0-mock"
+MOCK_APP_SERVER_VERSION = "0.0.0-mock"
+
+OPCODE_CONTINUATION = 0x0
+OPCODE_TEXT = 0x1
+OPCODE_BINARY = 0x2
+OPCODE_CLOSE = 0x8
+OPCODE_PING = 0x9
+OPCODE_PONG = 0xA
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
+
+class ChannelReader:
+    """Buffered reads over a paramiko channel, which returns partial data per recv."""
+
+    def __init__(self, channel: paramiko.Channel) -> None:
+        self.channel = channel
+        self.buffer = b""
+
+    def read_exact(self, length: int) -> bytes | None:
+        while len(self.buffer) < length:
+            if not self.fill():
+                return None
+        data, self.buffer = self.buffer[:length], self.buffer[length:]
+        return data
+
+    def read_until(self, marker: bytes) -> bytes | None:
+        while marker not in self.buffer:
+            if not self.fill():
+                return None
+        end = self.buffer.index(marker) + len(marker)
+        data, self.buffer = self.buffer[:end], self.buffer[end:]
+        return data
+
+    def fill(self) -> bool:
+        """Read one chunk. Returns False at EOF; idles through socket timeouts."""
+        try:
+            chunk = self.channel.recv(65536)
+        except socket.timeout:
+            return True
+        except (EOFError, OSError, paramiko.SSHException):
+            return False
+        if not chunk:
+            return False
+        self.buffer += chunk
+        return True
+
+
+class WebSocketTransport:
+    """RFC 6455 server side over one proxy stdio channel.
+
+    Client frames are unmasked with their 4-byte key; server frames are sent
+    unmasked with 7-bit, 16-bit or 64-bit payload lengths.
+    """
+
     def __init__(self, channel: paramiko.Channel, events: EventLog) -> None:
         self.channel = channel
         self.events = events
-        self.buffer = b""
+        self.reader = ChannelReader(channel)
+
+    def handshake(self) -> bool:
+        request = self.reader.read_until(b"\r\n\r\n")
+        if request is None:
+            return False
+        lines = request.decode("iso-8859-1").split("\r\n")
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(":")
+            if separator:
+                headers[name.strip().lower()] = value.strip()
+        key = headers.get("sec-websocket-key")
+        if not key:
+            self.events.write("websocket_handshake_rejected", request_line=lines[0])
+            self.channel.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            return False
+        digest = hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+        accept = base64.b64encode(digest).decode("ascii")
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        self.channel.sendall(response.encode("ascii"))
+        self.events.write("websocket_upgrade", request_line=lines[0])
+        return True
+
+    def send(self, message: dict[str, Any]) -> None:
+        payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.write_frame(OPCODE_TEXT, payload)
+
+    def receive(self) -> dict[str, Any] | None:
+        fragments = bytearray()
+        data_opcode = 0
+        while True:
+            frame = self.read_frame()
+            if frame is None:
+                return None
+            fin, opcode, payload = frame
+            if opcode == OPCODE_CONTINUATION:
+                if data_opcode == 0:
+                    self.events.write("websocket_protocol_error", detail="continuation without start frame")
+                    return None
+                fragments += payload
+                if fin:
+                    message = self.decode_message(data_opcode, bytes(fragments))
+                    if message is not None:
+                        return message
+                    data_opcode = 0
+                    fragments = bytearray()
+            elif opcode in (OPCODE_TEXT, OPCODE_BINARY):
+                if data_opcode != 0:
+                    self.events.write("websocket_protocol_error", detail="new message before fragmented message ended")
+                    return None
+                if fin:
+                    message = self.decode_message(opcode, payload)
+                    if message is not None:
+                        return message
+                else:
+                    data_opcode = opcode
+                    fragments = bytearray(payload)
+            elif opcode == OPCODE_PING:
+                self.write_frame(OPCODE_PONG, payload)
+            elif opcode == OPCODE_PONG:
+                continue
+            elif opcode == OPCODE_CLOSE:
+                self.write_frame(OPCODE_CLOSE, payload)
+                return None
+            else:
+                self.events.write("websocket_protocol_error", detail=f"unsupported opcode {opcode}")
+                return None
+
+    def write_frame(self, opcode: int, payload: bytes) -> None:
+        frame = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            frame.append(length)
+        elif length <= 0xFFFF:
+            frame.append(126)
+            frame += length.to_bytes(2, "big")
+        else:
+            frame.append(127)
+            frame += length.to_bytes(8, "big")
+        frame += payload
+        self.channel.sendall(bytes(frame))
+
+    def read_frame(self) -> tuple[bool, int, bytes] | None:
+        header = self.reader.read_exact(2)
+        if header is None:
+            return None
+        fin = bool(header[0] & 0x80)
+        opcode = header[0] & 0x0F
+        masked = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+        if length == 126:
+            extended = self.reader.read_exact(2)
+            if extended is None:
+                return None
+            length = int.from_bytes(extended, "big")
+        elif length == 127:
+            extended = self.reader.read_exact(8)
+            if extended is None:
+                return None
+            length = int.from_bytes(extended, "big")
+        if length > MAX_MESSAGE_BYTES:
+            self.events.write("websocket_protocol_error", detail=f"frame too large: {length}")
+            return None
+        mask_key = self.reader.read_exact(4) if masked else None
+        if masked and mask_key is None:
+            return None
+        payload = self.reader.read_exact(length)
+        if payload is None:
+            return None
+        if mask_key is not None:
+            payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        elif opcode < OPCODE_CLOSE:
+            self.events.write("websocket_protocol_error", detail="client data frame was not masked")
+            return None
+        if opcode >= OPCODE_CLOSE and (not fin or len(payload) > 125):
+            self.events.write("websocket_protocol_error", detail="invalid control frame")
+            return None
+        return fin, opcode, payload
+
+    def decode_message(self, opcode: int, payload: bytes) -> dict[str, Any] | None:
+        if opcode == OPCODE_BINARY:
+            self.events.write("client_binary_frame", length=len(payload))
+            return None
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            self.events.write("invalid_client_message", error=str(error))
+            return None
+        if not isinstance(message, dict):
+            self.events.write("invalid_client_message", error="payload is not a JSON object")
+            return None
+        return message
+
+
+class DaemonState:
+    """Shared `codex app-server daemon start` state: idempotent across channels."""
+
+    def __init__(self, socket_path: str) -> None:
+        self.socket_path = socket_path
+        self.lock = threading.Lock()
+        self.running = False
+
+    def start(self) -> dict[str, str]:
+        with self.lock:
+            status = "alreadyRunning" if self.running else "started"
+            self.running = True
+        return {
+            "status": status,
+            "socketPath": self.socket_path,
+            "cliVersion": MOCK_CLI_VERSION,
+            "appServerVersion": MOCK_APP_SERVER_VERSION,
+        }
+
+
+class MockAppServer:
+    def __init__(self, transport: WebSocketTransport, events: EventLog) -> None:
+        self.transport = transport
+        self.events = events
         self.threads = [
             {
                 "id": "thread-demo-primary",
@@ -115,8 +335,7 @@ class MockAppServer:
 
     def send(self, message: dict[str, Any]) -> None:
         self.events.write("server_message", message=message)
-        payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
-        self.channel.sendall(payload.encode("utf-8"))
+        self.transport.send(message)
 
     def result(self, request: dict[str, Any], result: dict[str, Any]) -> None:
         self.send({"id": request["id"], "result": result})
@@ -125,26 +344,12 @@ class MockAppServer:
         self.send({"method": method, "params": params})
 
     def run(self) -> None:
-        self.channel.settimeout(1.0)
-        while not self.channel.closed:
-            try:
-                chunk = self.channel.recv(65536)
-            except socket.timeout:
-                continue
-            if not chunk:
+        while True:
+            message = self.transport.receive()
+            if message is None:
                 break
-            self.buffer += chunk
-            while b"\n" in self.buffer:
-                raw, self.buffer = self.buffer.split(b"\n", 1)
-                if not raw.strip():
-                    continue
-                try:
-                    message = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    self.events.write("invalid_client_message", error=str(error))
-                    continue
-                self.events.write("client_message", message=message)
-                self.handle(message)
+            self.events.write("client_message", message=message)
+            self.handle(message)
 
     def handle(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -637,12 +842,29 @@ def load_or_create_host_key(path: Path) -> paramiko.RSAKey:
     return key
 
 
+def serve_proxy(channel: paramiko.Channel, events: EventLog) -> None:
+    """Serve one `codex app-server proxy` channel as WebSocket-over-stdio."""
+    channel.settimeout(1.0)
+    transport = WebSocketTransport(channel, events)
+    try:
+        if not transport.handshake():
+            channel.send_exit_status(1)
+            return
+        MockAppServer(transport, events).run()
+        channel.send_exit_status(0)
+    except (EOFError, OSError, paramiko.SSHException) as error:
+        events.write("proxy_error", error=type(error).__name__, detail=str(error))
+    finally:
+        channel.close()
+
+
 def handle_client(
     client: socket.socket,
     peer: tuple[str, int],
     host_key: paramiko.PKey,
     username: str,
     password: str,
+    daemon: DaemonState,
     events: EventLog,
 ) -> None:
     events.write("connection_open", peer=f"{peer[0]}:{peer[1]}")
@@ -664,18 +886,19 @@ def handle_client(
             command = server.command
             server.exec_event.clear()
             time.sleep(0.05)
-            if "__CODEX_POSIX__" in command:
-                channel.sendall(b"__CODEX_POSIX__")
+            if "codex app-server daemon start" in command:
+                lifecycle = daemon.start()
+                events.write(
+                    "daemon_start",
+                    status=lifecycle["status"],
+                    socket_path=lifecycle["socketPath"],
+                )
+                channel.sendall((json.dumps(lifecycle, separators=(",", ":")) + "\n").encode("utf-8"))
                 channel.send_exit_status(0)
                 channel.close()
                 continue
-            if "codex --version" in command:
-                channel.sendall(b"codex-cli 0.0.0-mock\n")
-                channel.send_exit_status(0)
-                channel.close()
-                continue
-            if "codex app-server --listen stdio://" in command:
-                MockAppServer(channel, events).run()
+            if "codex app-server proxy --sock" in command:
+                serve_proxy(channel, events)
                 continue
             channel.send_stderr(b"codex command not found\n")
             channel.send_exit_status(127)
@@ -702,6 +925,7 @@ def main() -> None:
     events_path.write_text("", encoding="utf-8")
     events = EventLog(events_path)
     host_key = load_or_create_host_key(args.state_dir / "host_rsa_key")
+    daemon = DaemonState(MOCK_SOCKET_PATH)
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -719,7 +943,7 @@ def main() -> None:
             client, peer = listener.accept()
             threading.Thread(
                 target=handle_client,
-                args=(client, peer, host_key, args.username, args.password, events),
+                args=(client, peer, host_key, args.username, args.password, daemon, events),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:
