@@ -48,6 +48,9 @@ Audit baseline:
 
 ### SSH and platform integration
 
+- Windows remote hosts are unsupported. The app requires a POSIX host with a Codex install created by `install.sh`, reached through `codex app-server daemon start` and `codex app-server proxy --sock` over SSH.
+- The remote app-server is a shared, persistent daemon. Android never stops, restarts or bootstraps it, and remote turns keep running while the phone is disconnected.
+- No external `--remote-socket` mode for a user-managed control socket, and no automatic reconnect or resubscribe after connection loss.
 - OpenSSH config expansion, ProxyJump, SSH agent or hardware-key authentication, and managed relay pairing.
 - Remote file open-in-editor actions, deep links, desktop notifications, and Android share-sheet integration.
 

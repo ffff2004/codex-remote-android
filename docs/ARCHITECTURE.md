@@ -29,9 +29,13 @@ Android UI
    v
 Remote login shell
    |
-   | codex app-server --listen stdio://
+   | codex app-server daemon start        (idempotent, one lifecycle JSON line)
    v
-JSONL transport over SSH stdin/stdout
+socketPath: 0600 Unix control socket (no TCP listener)
+   |
+   | codex app-server proxy --sock <socketPath>
+   v
+WebSocket-over-stdio on the SSH channel (RFC 6455)
    |
    +-- initialize / initialized
    +-- thread/list (all cursor pages, no cwd filter)
@@ -50,12 +54,29 @@ JSONL transport over SSH stdin/stdout
    +-- command, file-change, permission and user-input approvals
 ```
 
+`daemon start` is invoked on every connect and is idempotent. The lifecycle line
+is parsed strictly for the `status` and absolute POSIX `socketPath` that the
+proxy command needs, and tolerantly for additive fields. The daemon lifecycle
+JSON contract is experimental and may change; the client ignores unknown fields
+so additive changes are safe. The socket path is POSIX-shell-quoted before it is
+embedded in the remote command, and the client never interpolates raw remote
+JSON into a shell string.
+
+The proxied stdio stream is an RFC 6455 WebSocket: the client sends an HTTP
+`GET ws://localhost/` Upgrade with `Sec-WebSocket-Key` and
+`Sec-WebSocket-Version: 13`, validates `101 Switching Protocols` plus
+`Sec-WebSocket-Accept`, then exchanges JSON-RPC 2.0 messages (with the `jsonrpc`
+header omitted) as WebSocket text frames. Client frames are masked; server frames
+are unmasked. No compression and no subprotocol are requested.
+
 Agent execution, repository access, authentication, tools and approvals remain
-owned by the remote Codex installation. Android has no local agent runtime.
+owned by the remote Codex installation, and the daemon is shared and persistent:
+turns keep running while Android is disconnected. Android has no local agent
+runtime and never stops or restarts the daemon implicitly.
 
 ## Host-wide discovery
 
-A saved connection stores only SSH host, authentication and platform details.
+A saved connection stores only SSH host and authentication details.
 On connection, the client requests every page of non-archived interactive
 threads with the same empty `sourceKinds` filter as Desktop. It deliberately
 omits the optional `cwd` field from `thread/list`, follows `nextCursor` until it
@@ -97,7 +118,9 @@ whose OAuth provider redirects to loopback must configure a reachable
 - Android backup and device transfer are disabled for all app data domains.
 - A new SSH host is rejected before authentication and its SHA-256 fingerprint
   is shown for explicit confirmation. A changed key is always blocked.
-- app-server uses stdio inside SSH. No app-server TCP listener is exposed.
+- The app-server daemon's control socket is a `0600` Unix domain socket with no
+  TCP listener. The client reaches it only through `codex app-server proxy` on
+  the SSH channel, so SSH remains the trust boundary.
 - The remote thread starts with `workspace-write` sandboxing and `on-request`
   approval by default. Named permission profiles are loaded from the host.
   Explicit full access maps to the app-server `dangerFullAccess` policy.
@@ -109,6 +132,13 @@ types are ignored, while unknown server-initiated requests are surfaced rather
 than automatically approved. Because schemas are tied to the installed Codex
 version, the Android protocol layer should be tested whenever the remote Codex
 installation is upgraded across major protocol changes.
+
+The runtime is single-path by design: POSIX remote hosts running a Codex
+installation created by `install.sh`. Windows remotes, npm-installed Codex, and
+the removed JSONL stdio transport are unsupported. There is no external
+`--remote-socket` mode and no automatic reconnect: on connection loss the client
+surfaces a failure and waits for a manual reconnect while the remote daemon keeps
+running.
 
 Current SSH connection setup supports direct password and private-key hosts.
 OpenSSH config expansion, ProxyJump, hardware-backed SSH agents and managed

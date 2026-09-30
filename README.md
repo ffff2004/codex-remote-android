@@ -6,8 +6,10 @@
 An Android client for Codex hosts reached over SSH. A saved connection represents
 one host; after connecting, the app imports every resumable remote Codex
 conversation and groups projects from each thread's working directory. The app
-does not run a local agent: it starts `codex app-server` remotely and speaks its
-JSONL protocol over SSH.
+does not run a local agent: it starts the shared remote app-server daemon with
+`codex app-server daemon start`, then reaches that daemon's Unix control socket
+through `codex app-server proxy --sock`, carrying RFC 6455 WebSocket frames over
+the SSH channel.
 
 Implementation notes and the audited Codex source boundary are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -16,11 +18,23 @@ The current Desktop parity matrix and known gaps are tracked in
 
 ## Remote host requirements
 
-- OpenSSH access with a password or PEM/OpenSSH private key.
-- `codex` installed and available from the remote login shell (`codex --version`).
+- A POSIX host (Linux or macOS) with OpenSSH access using a password or
+  PEM/OpenSSH private key.
+- Codex installed with the standalone installer from
+  <https://chatgpt.com/codex/install.sh>, so `codex` is available from the remote
+  login shell in the layout the app-server daemon manages
+  (`$CODEX_HOME/packages/standalone/current/codex`). npm-installed Codex and
+  Windows remotes are not supported.
 - A Codex account on the remote host. Existing API-key/ChatGPT auth is reused;
   when required, the app can start Codex's remote ChatGPT device-code login.
 - A trusted, least-privilege remote user.
+
+The remote app-server is a shared, persistent daemon. `codex app-server daemon
+start` runs on every connect and is idempotent; Android never stops, restarts or
+bootstraps it, and remote turns keep running while the phone is disconnected.
+The app connects to the daemon's `0600` Unix control socket through
+`codex app-server proxy`; SSH is the trust boundary and no TCP app-server
+listener is exposed.
 
 No project path is configured on Android. Existing projects and conversations
 come from the remote Codex history returned by `thread/list`.
