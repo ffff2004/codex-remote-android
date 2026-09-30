@@ -10,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
@@ -126,9 +127,9 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
         try {
             val started = session.exec(daemonStartCommand())
             command = started
-            val stderrTail = StderrTail()
+            val lastStderr = LastStderrLine()
             drain = Thread(
-                { drainStderr(started.errorStream, stderrTail::record) },
+                { drainStderr(started.errorStream, lastStderr::record) },
                 "codex-daemon-start-stderr",
             ).apply {
                 isDaemon = true
@@ -141,14 +142,14 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
                 if (error is CancellationException) throw error
                 throw AppServerException.DaemonStartFailed(
                     started.exitStatus ?: -1,
-                    stderrTail.detail().ifBlank { error.message.orEmpty() },
+                    lastStderr.lastLine().ifBlank { error.message.orEmpty() },
                 )
             }
             if (line == null) {
                 started.join(DAEMON_START_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 runCatching { started.close() }
                 drain.join(STDERR_DRAIN_JOIN_MILLIS)
-                throw AppServerException.DaemonStartFailed(started.exitStatus ?: -1, stderrTail.detail())
+                throw AppServerException.DaemonStartFailed(started.exitStatus ?: -1, lastStderr.lastLine())
             }
             return DaemonLifecycle.parse(line)
         } finally {
@@ -202,7 +203,8 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
         runCatching { ssh.close() }
     }
 
-    private class StderrTail {
+    /** Holds only the last non-blank stderr line so a daemon-start failure can report it. */
+    private class LastStderrLine {
         private val lock = Any()
         private var last: String = ""
 
@@ -211,7 +213,7 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
             synchronized(lock) { last = line }
         }
 
-        fun detail(): String = synchronized(lock) { last }
+        fun lastLine(): String = synchronized(lock) { last }
     }
 
     private companion object {
@@ -240,7 +242,9 @@ private class SshAppServerSession(
     override val diagnostics: Flow<String> = diagnosticChannel.receiveAsFlow()
 
     init {
-        scope.launch { pumpMessages() }
+        scope.launch {
+            pumpAppServerMessages(webSocket.messages, json, messageChannel, diagnosticChannel)
+        }
         scope.launch { pumpDiagnostics() }
     }
 
@@ -262,22 +266,6 @@ private class SshAppServerSession(
         runCatching { ssh.close() }
     }
 
-    private suspend fun pumpMessages() {
-        try {
-            webSocket.messages.collect { text ->
-                val payload = runCatching { json.parseToJsonElement(text) }.getOrNull() as? JsonObject
-                    ?: throw AppServerException.AppServerConnectionLost("app-server 返回了非法 JSON")
-                messageChannel.send(payload)
-            }
-            messageChannel.close()
-        } catch (cancelled: CancellationException) {
-            messageChannel.close(cancelled)
-            throw cancelled
-        } catch (error: Throwable) {
-            messageChannel.close(error)
-        }
-    }
-
     private suspend fun pumpDiagnostics() {
         try {
             command.errorStream.bufferedReader(Charsets.UTF_8).forEachLine { line ->
@@ -293,6 +281,35 @@ private class SshAppServerSession(
     }
 
     private fun closedException() = AppServerException.AppServerConnectionLost("session 已关闭")
+}
+
+/**
+ * Routes decoded WebSocket text frames into [messages]. A frame that is not a JSON object is reported on
+ * [diagnostics] and collection continues; only a failing/terminating source closes [messages] (with the
+ * cause, or normally on EOF).
+ */
+internal suspend fun pumpAppServerMessages(
+    source: Flow<String>,
+    json: Json,
+    messages: SendChannel<JsonObject>,
+    diagnostics: SendChannel<String>,
+) {
+    try {
+        source.collect { text ->
+            val payload = runCatching { json.parseToJsonElement(text) }.getOrNull() as? JsonObject
+            if (payload != null) {
+                messages.send(payload)
+            } else {
+                diagnostics.trySend("无法解析 app-server 输出：$text")
+            }
+        }
+        messages.close()
+    } catch (cancelled: CancellationException) {
+        messages.close(cancelled)
+        throw cancelled
+    } catch (error: Throwable) {
+        messages.close(error)
+    }
 }
 
 internal fun daemonStartCommand(): String =

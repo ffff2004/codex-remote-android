@@ -84,6 +84,16 @@ internal class WebSocketOverStdio(
         if (response.header("sec-websocket-accept") != acceptValue(key)) {
             throw AppServerException.WebSocketHandshakeFailed("Sec-WebSocket-Accept 校验失败")
         }
+        if (!response.hasToken("upgrade", "websocket")) {
+            throw AppServerException.WebSocketHandshakeFailed(
+                "Upgrade 头不是 websocket：${response.header("upgrade") ?: "缺失"}",
+            )
+        }
+        if (!response.hasToken("connection", "upgrade")) {
+            throw AppServerException.WebSocketHandshakeFailed(
+                "Connection 头不含 Upgrade：${response.header("connection") ?: "缺失"}",
+            )
+        }
     }
 
     /** Sends one masked text frame. Throws after [close]. */
@@ -112,8 +122,9 @@ internal class WebSocketOverStdio(
                     appendFragment(fragments, frame.payload)
                     if (frame.fin) {
                         val message = decodeMessage(dataOpcode, fragments.toByteArray())
-                        if (message != null) return message
                         dataOpcode = -1
+                        fragments.reset()
+                        if (message != null) return message
                     }
                 }
 
@@ -123,6 +134,8 @@ internal class WebSocketOverStdio(
                     }
                     if (frame.fin) {
                         val message = decodeMessage(frame.opcode, frame.payload)
+                        dataOpcode = -1
+                        fragments.reset()
                         if (message != null) return message
                     } else {
                         dataOpcode = frame.opcode
@@ -308,6 +321,10 @@ internal class WebSocketOverStdio(
         val headers: Map<String, String>,
     ) {
         fun header(name: String): String? = headers[name.lowercase()]
+
+        /** RFC 7230 token-list membership, e.g. `Connection: keep-alive, Upgrade`. */
+        fun hasToken(name: String, token: String): Boolean =
+            header(name)?.split(',')?.any { it.trim().equals(token, ignoreCase = true) } == true
     }
 
     private data class WebSocketFrame(

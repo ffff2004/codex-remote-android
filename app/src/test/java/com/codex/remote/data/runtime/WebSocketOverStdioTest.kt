@@ -49,6 +49,35 @@ class WebSocketOverStdioTest {
     }
 
     @Test
+    fun upgradeRejectsMissingOrWrongUpgradeHeader() {
+        val (missing, _) = socketFor(upgradeHeader = null)
+        val (wrong, _) = socketFor(upgradeHeader = "h2c")
+
+        assertThrows(AppServerException.WebSocketHandshakeFailed::class.java) {
+            missing.upgrade()
+        }
+        assertThrows(AppServerException.WebSocketHandshakeFailed::class.java) {
+            wrong.upgrade()
+        }
+    }
+
+    @Test
+    fun upgradeRejectsConnectionHeaderWithoutUpgradeToken() {
+        val (socket, _) = socketFor(connectionHeader = "keep-alive, close")
+
+        assertThrows(AppServerException.WebSocketHandshakeFailed::class.java) {
+            socket.upgrade()
+        }
+    }
+
+    @Test
+    fun upgradeAcceptsCaseInsensitiveCommaSeparatedConnectionTokens() {
+        val (socket, _) = socketFor(upgradeHeader = "WebSocket", connectionHeader = "keep-alive, upgrade")
+
+        socket.upgrade()
+    }
+
+    @Test
     fun sendTextSetsMaskBitAndEncodesPayload() {
         val (socket, output) = socketFor()
         socket.upgrade()
@@ -76,6 +105,21 @@ class WebSocketOverStdioTest {
         socket.upgrade()
 
         assertEquals(listOf("Hello world"), runBlocking { socket.messages.toList() })
+    }
+
+    @Test
+    fun fragmentedBinaryMessageDoesNotLeakIntoFollowingTextMessage() {
+        val frames = concat(
+            serverFrame(OPCODE_BINARY, byteArrayOf(0x00, 0x01), fin = false),
+            serverFrame(OPCODE_CONTINUATION, byteArrayOf(0xFF.toByte(), 0xFE.toByte()), fin = true),
+            serverFrame(OPCODE_TEXT, "Hel".toByteArray(), fin = false),
+            serverFrame(OPCODE_CONTINUATION, "lo".toByteArray(), fin = true),
+            serverFrame(OPCODE_CLOSE, closePayload()),
+        )
+        val (socket, _) = socketFor(serverBytes = frames)
+        socket.upgrade()
+
+        assertEquals(listOf("Hello"), runBlocking { socket.messages.toList() })
     }
 
     @Test
@@ -170,19 +214,32 @@ class WebSocketOverStdioTest {
         serverBytes: ByteArray = ByteArray(0),
         status: Int = 101,
         accept: String? = null,
+        upgradeHeader: String? = "websocket",
+        connectionHeader: String? = "Upgrade",
     ): Pair<WebSocketOverStdio, ByteArrayOutputStream> {
-        val response = upgradeResponse(status, accept ?: WebSocketOverStdio.acceptValue(keyForSeed(seed)))
+        val response = upgradeResponse(
+            status = status,
+            accept = accept ?: WebSocketOverStdio.acceptValue(keyForSeed(seed)),
+            upgradeHeader = upgradeHeader,
+            connectionHeader = connectionHeader,
+        )
         val input = ByteArrayInputStream(response.toByteArray(Charsets.ISO_8859_1) + serverBytes)
         val output = ByteArrayOutputStream()
         return WebSocketOverStdio(input, output, Random(seed)) to output
     }
 
-    private fun upgradeResponse(status: Int, accept: String): String =
-        "HTTP/1.1 $status ${if (status == 101) "Switching Protocols" else "Error"}\r\n" +
-            "Upgrade: websocket\r\n" +
-            "Connection: Upgrade\r\n" +
-            "Sec-WebSocket-Accept: $accept\r\n" +
-            "\r\n"
+    private fun upgradeResponse(
+        status: Int,
+        accept: String,
+        upgradeHeader: String? = "websocket",
+        connectionHeader: String? = "Upgrade",
+    ): String = buildString {
+        append("HTTP/1.1 $status ${if (status == 101) "Switching Protocols" else "Error"}\r\n")
+        upgradeHeader?.let { append("Upgrade: $it\r\n") }
+        connectionHeader?.let { append("Connection: $it\r\n") }
+        append("Sec-WebSocket-Accept: $accept\r\n")
+        append("\r\n")
+    }
 
     private fun keyForSeed(seed: Long): String {
         val random = Random(seed)
@@ -279,6 +336,7 @@ class WebSocketOverStdioTest {
         const val SEED = 7L
         const val OPCODE_CONTINUATION = 0
         const val OPCODE_TEXT = 1
+        const val OPCODE_BINARY = 2
         const val OPCODE_CLOSE = 8
         const val OPCODE_PING = 9
         const val OPCODE_PONG = 10
