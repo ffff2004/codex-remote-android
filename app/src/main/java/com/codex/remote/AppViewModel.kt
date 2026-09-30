@@ -1441,18 +1441,8 @@ class AppViewModel @JvmOverloads constructor(
                             }
                         }
                     }
-                    is AppServerEvent.Failure -> _state.update { state ->
-                        if (state.acceptsThreadEvent(event.threadId)) {
-                            state.copy(
-                                notice = event.message,
-                                isTurnRunning = false,
-                                activeTurnId = null,
-                                timeline = state.timeline.withRunningItemsCompleted(),
-                            )
-                        } else {
-                            state
-                        }
-                    }
+                    is AppServerEvent.Failure ->
+                        _state.update { it.applyServerFailure(event.message, event.threadId) }
                     is AppServerEvent.Warning -> _state.update { it.copy(notice = event.message) }
                     is AppServerEvent.Diagnostic -> {
                         if (event.message.contains("not found", ignoreCase = true) ||
@@ -1700,6 +1690,24 @@ private data class ConnectionBootstrap(
 
 internal fun AppUiState.acceptsThreadEvent(threadId: String?): Boolean =
     selectedThreadId != null && selectedThreadId == threadId
+
+/**
+ * Applies an app-server failure. A failure without a thread id is session-level: it stops the active turn and marks
+ * the connection as errored regardless of the selected thread. A thread-level failure only applies to the selected
+ * thread and leaves the connection status alone.
+ */
+internal fun AppUiState.applyServerFailure(message: String, threadId: String?): AppUiState {
+    val sessionLevel = threadId == null
+    if (!sessionLevel && !acceptsThreadEvent(threadId)) return this
+    return copy(
+        notice = message,
+        isTurnRunning = false,
+        activeTurnId = null,
+        timeline = timeline.withRunningItemsCompleted(),
+        connectionStatus = if (sessionLevel) ConnectionStatus.ERROR else connectionStatus,
+        connectionMessage = if (sessionLevel) message else connectionMessage,
+    )
+}
 
 internal fun List<SavedConnection>.lastUsedConnectionOrNull(): SavedConnection? =
     maxByOrNull(SavedConnection::lastUsedAt)?.takeIf { it.lastUsedAt > 0 }

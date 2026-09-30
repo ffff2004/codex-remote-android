@@ -3,6 +3,7 @@ package com.codex.remote
 import com.codex.remote.data.rpc.RpcException
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ComposerMentionKind
+import com.codex.remote.domain.ConnectionStatus
 import com.codex.remote.domain.RemotePlugin
 import com.codex.remote.domain.RemoteProject
 import com.codex.remote.domain.RemoteSkill
@@ -100,6 +101,46 @@ class ComposerStateTest {
         assertTrue(state.acceptsThreadEvent("thread-a"))
         assertFalse(state.acceptsThreadEvent("thread-b"))
         assertFalse(state.acceptsThreadEvent(null))
+    }
+
+    @Test
+    fun sessionLevelFailureSurfacesAndErrorsTheConnectionWithoutASelectedThread() {
+        val state = AppUiState(
+            connectionStatus = ConnectionStatus.CONNECTED,
+            isTurnRunning = true,
+            activeTurnId = "turn-1",
+            timeline = listOf(TimelineItem("answer", TimelineKind.AGENT, status = "inProgress")),
+        )
+
+        val failed = state.applyServerFailure("远端 app-server 已断开", threadId = null)
+
+        assertEquals("远端 app-server 已断开", failed.notice)
+        assertEquals("远端 app-server 已断开", failed.connectionMessage)
+        assertEquals(ConnectionStatus.ERROR, failed.connectionStatus)
+        assertFalse(failed.isTurnRunning)
+        assertNull(failed.activeTurnId)
+        assertEquals(listOf("completed"), failed.timeline.map { it.status })
+    }
+
+    @Test
+    fun sessionLevelFailureAppliesEvenWhileAnotherThreadIsSelected() {
+        val state = AppUiState(connectionStatus = ConnectionStatus.CONNECTED, selectedThreadId = "thread-a")
+
+        val failed = state.applyServerFailure("SSH 数据流已中断", threadId = null)
+
+        assertEquals(ConnectionStatus.ERROR, failed.connectionStatus)
+        assertEquals("SSH 数据流已中断", failed.notice)
+    }
+
+    @Test
+    fun threadLevelFailureOnlyAppliesToTheSelectedThread() {
+        val state = AppUiState(connectionStatus = ConnectionStatus.CONNECTED, selectedThreadId = "thread-a")
+
+        assertEquals(state, state.applyServerFailure("turn 执行失败", threadId = "thread-b"))
+
+        val applied = state.applyServerFailure("turn 执行失败", threadId = "thread-a")
+        assertEquals("turn 执行失败", applied.notice)
+        assertEquals(ConnectionStatus.CONNECTED, applied.connectionStatus)
     }
 
     @Test
