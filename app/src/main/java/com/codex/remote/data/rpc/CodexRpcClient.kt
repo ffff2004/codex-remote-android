@@ -1,7 +1,7 @@
 package com.codex.remote.data.rpc
 
 import com.codex.remote.BuildConfig
-import com.codex.remote.data.ssh.ActiveSshTransport
+import com.codex.remote.data.runtime.AppServerSession
 import com.codex.remote.domain.ApprovalKind
 import com.codex.remote.domain.ApprovalQuestion
 import com.codex.remote.domain.ApprovalRequest
@@ -45,9 +45,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -101,12 +98,11 @@ sealed interface AppServerEvent {
 class RpcException(message: String, val code: Int? = null) : Exception(message)
 
 class CodexRpcClient(
-    private val transport: ActiveSshTransport,
+    private val session: AppServerSession,
 ) : Closeable {
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val requestId = AtomicLong(1)
     private val pending = ConcurrentHashMap<String, CompletableDeferred<JsonObject>>()
-    private val writeMutex = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _events = MutableSharedFlow<AppServerEvent>(extraBufferCapacity = 128)
     val events: SharedFlow<AppServerEvent> = _events
@@ -123,9 +119,9 @@ class CodexRpcClient(
         return RemoteServerInfo(
             userAgent = result.string("userAgent").orEmpty(),
             codexHome = result.string("codexHome").orEmpty(),
-            platformFamily = result.string("platformFamily") ?: transport.remotePlatform.name.lowercase(),
-            platformOs = result.string("platformOs") ?: transport.remotePlatform.name.lowercase(),
-            codexVersion = transport.codexVersion,
+            platformFamily = result.string("platformFamily") ?: "unknown",
+            platformOs = result.string("platformOs") ?: "unknown",
+            codexVersion = session.version.cli.ifBlank { session.version.appServer },
         )
     }
 
@@ -617,24 +613,11 @@ class CodexRpcClient(
         put("result", result)
     })
 
-    private suspend fun send(message: JsonObject) = writeMutex.withLock {
-        withContext(Dispatchers.IO) {
-            transport.writer.write(json.encodeToString(JsonObject.serializer(), message))
-            transport.writer.newLine()
-            transport.writer.flush()
-        }
-    }
+    private suspend fun send(message: JsonObject) = session.send(message)
 
     private suspend fun readLoop() {
         try {
-            while (true) {
-                val line = transport.reader.readLine() ?: break
-                if (line.isBlank()) continue
-                val message = runCatching { json.parseToJsonElement(line).jsonObject }.getOrNull()
-                if (message == null) {
-                    _events.emit(AppServerEvent.Diagnostic("无法解析 app-server 输出：$line"))
-                    continue
-                }
+            session.messages.collect { message ->
                 val id = message["id"]?.jsonPrimitive?.contentOrNull
                 if (id != null && (message.containsKey("result") || message.containsKey("error"))) {
                     val deferred = pending.remove(id)
@@ -649,9 +632,9 @@ class CodexRpcClient(
                     } else {
                         deferred?.complete(message.obj("result") ?: buildJsonObject {})
                     }
-                    continue
+                    return@collect
                 }
-                val method = message.string("method") ?: continue
+                val method = message.string("method") ?: return@collect
                 val params = message.obj("params") ?: buildJsonObject {}
                 if (id != null) handleServerRequest(id, method, params) else handleNotification(method, params)
             }
@@ -668,11 +651,8 @@ class CodexRpcClient(
     }
 
     private suspend fun stderrLoop() {
-        runCatching {
-            while (true) {
-                val line = transport.errorReader.readLine() ?: break
-                if (line.isNotBlank()) _events.emit(AppServerEvent.Diagnostic(line))
-            }
+        session.diagnostics.collect { line ->
+            if (line.isNotBlank()) _events.emit(AppServerEvent.Diagnostic(line))
         }
     }
 
@@ -1418,7 +1398,7 @@ class CodexRpcClient(
     override fun close() {
         readerJob?.cancel()
         scope.cancel()
-        transport.close()
+        session.close()
     }
 }
 

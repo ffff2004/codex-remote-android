@@ -5,8 +5,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.codex.remote.data.rpc.AppServerEvent
 import com.codex.remote.data.rpc.CodexRpcClient
-import com.codex.remote.data.ssh.SshAppServerTransportFactory
-import com.codex.remote.data.ssh.UnknownHostKeyException
+import com.codex.remote.data.runtime.AppServerException
+import com.codex.remote.data.runtime.AppServerRuntime
+import com.codex.remote.data.runtime.SshCodexAppServerRuntime
+import com.codex.remote.data.runtime.UnknownHostKeyException
 import com.codex.remote.data.store.ConnectionStore
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ApprovalKind
@@ -45,9 +47,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.UUID
 
-class AppViewModel(application: Application) : AndroidViewModel(application) {
+class AppViewModel @JvmOverloads constructor(
+    application: Application,
+    private val runtime: AppServerRuntime = SshCodexAppServerRuntime(application),
+) : AndroidViewModel(application) {
     private val store = ConnectionStore(application)
-    private val transportFactory = SshAppServerTransportFactory(application)
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
@@ -182,8 +186,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             runCatching {
                 val secrets = withContext(Dispatchers.IO) { store.decrypt(connection) }
-                val transport = transportFactory.open(connection, secrets)
-                val client = CodexRpcClient(transport)
+                val session = runtime.open(connection, secrets)
+                val client = CodexRpcClient(session)
                 rpc = client
                 observeEvents(client)
                 val server = withTimeout(20_000) { client.initialize() }
@@ -1646,6 +1650,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun friendlyError(error: Throwable): String {
+        generateSequence(error) { it.cause }
+            .filterIsInstance<AppServerException>()
+            .firstOrNull()
+            ?.let { return friendlyAppServerError(it) }
         val message = generateSequence(error) { it.cause }
             .mapNotNull { it.message }
             .firstOrNull { it.isNotBlank() }
@@ -1659,6 +1667,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             message.contains("refused", ignoreCase = true) -> "SSH 连接被拒绝，请确认 sshd 正在监听。"
             else -> message
         }
+    }
+
+    private fun friendlyAppServerError(error: AppServerException): String = when (error) {
+        is AppServerException.DaemonStartFailed -> buildString {
+            append("远端 Codex app-server daemon 启动失败（exit=${error.exitStatus}）。")
+            append("请确认远端已安装 Codex：https://chatgpt.com/codex/install.sh。")
+            if (error.stderrDetail.isNotBlank()) append("远端输出：${error.stderrDetail}")
+        }
+        is AppServerException.IncompatibleDaemon ->
+            "远端 Codex daemon 响应不兼容：${error.detail}。请更新远端 Codex 后重试。"
+        is AppServerException.WebSocketHandshakeFailed ->
+            "与远端 app-server 的 WebSocket 握手失败：${error.detail}。请确认远端 Codex 安装完整后重试。"
+        is AppServerException.AppServerConnectionLost ->
+            "远端 app-server 连接已断开：${error.detail}。远端任务可能仍在运行，请手动重连。"
     }
 
     override fun onCleared() {
