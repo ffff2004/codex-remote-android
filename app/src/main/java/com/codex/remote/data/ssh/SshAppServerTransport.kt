@@ -23,13 +23,9 @@ import java.security.PublicKey
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 
-class HostKeyChangedException(
-    expected: String,
-    actual: String,
-) : SecurityException("SSH 主机密钥已变更。已保存 $expected，当前为 $actual")
+typealias HostKeyChangedException = com.codex.remote.data.runtime.HostKeyChangedException
 
-class UnknownHostKeyException(val fingerprint: String) :
-    SecurityException("首次连接需要确认 SSH 主机指纹：$fingerprint")
+typealias UnknownHostKeyException = com.codex.remote.data.runtime.UnknownHostKeyException
 
 class RemoteCodexUnavailableException(message: String) : IllegalStateException(message)
 
