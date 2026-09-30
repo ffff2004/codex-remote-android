@@ -17,8 +17,8 @@ sealed class AppServerException(message: String) : Exception(message) {
 }
 
 /**
- * Host key exceptions live in the runtime module. [com.codex.remote.data.ssh.SshAppServerTransport] keeps
- * type aliases so the legacy SSH path and existing callers still compile during the migration.
+ * Host key verification failures surfaced by [SshCodexAppServerRuntime] so the UI can offer a
+ * trust prompt or warn about a changed key.
  */
 class HostKeyChangedException(
     expected: String,

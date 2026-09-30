@@ -70,7 +70,6 @@ import com.codex.remote.domain.AuthType
 import com.codex.remote.domain.ConnectionDraft
 import com.codex.remote.domain.ConnectionDraftIssue
 import com.codex.remote.domain.ConnectionStatus
-import com.codex.remote.domain.RemotePlatform
 import com.codex.remote.domain.SavedConnection
 import com.codex.remote.domain.validationIssues
 
@@ -432,16 +431,6 @@ private fun ConnectionEditor(
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                    SectionLabel("REMOTE PLATFORM")
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        RemotePlatform.entries.forEach { platform ->
-                            FilterChip(
-                                selected = draft.platform == platform,
-                                onClick = { draft = draft.copy(platform = platform) },
-                                label = { Text(platform.displayName) },
-                            )
-                        }
-                    }
                     if (draft.hostKeyFingerprint.isNotBlank()) {
                         SectionLabel("HOST KEY")
                         OutlinedTextField(
@@ -507,12 +496,4 @@ private fun SavedConnection?.toDraft(): ConnectionDraft = if (this == null) Conn
     username = username,
     authType = authType,
     hostKeyFingerprint = hostKeyFingerprint,
-    platform = platform,
 )
-
-private val RemotePlatform.displayName: String
-    get() = when (this) {
-        RemotePlatform.AUTO -> "Auto"
-        RemotePlatform.POSIX -> "Linux / macOS"
-        RemotePlatform.WINDOWS -> "Windows"
-    }

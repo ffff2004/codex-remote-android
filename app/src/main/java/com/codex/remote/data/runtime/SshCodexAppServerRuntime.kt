@@ -190,12 +190,6 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
         return "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(digest)
     }
 
-    private fun androidCompatibleSshConfig() = DefaultSecurityProviderConfig().apply {
-        keyExchangeFactories = keyExchangeFactories.filterNot {
-            it.name.contains("curve25519", ignoreCase = true)
-        }
-    }
-
     private fun drainStderr(source: InputStream, record: (String) -> Unit) {
         runCatching {
             source.bufferedReader(Charsets.UTF_8).forEachLine(record)
@@ -304,6 +298,16 @@ private class SshAppServerSession(
 internal fun daemonStartCommand(): String =
     "exec \"\${SHELL:-/bin/sh}\" -lc " +
         DaemonLifecycle.posixQuote("exec codex app-server daemon start")
+
+/**
+ * SSHJ's curve25519 KEX cannot be instantiated on Android, so the runtime pins an
+ * OpenSSH-compatible provider set without those factories.
+ */
+internal fun androidCompatibleSshConfig() = DefaultSecurityProviderConfig().apply {
+    keyExchangeFactories = keyExchangeFactories.filterNot {
+        it.name.contains("curve25519", ignoreCase = true)
+    }
+}
 
 internal fun daemonProxyCommand(socketPath: String): String =
     "exec \"\${SHELL:-/bin/sh}\" -lc " +

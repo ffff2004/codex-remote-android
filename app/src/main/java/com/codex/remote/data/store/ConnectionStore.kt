@@ -57,7 +57,6 @@ class ConnectionStore(
             encryptedPassphrase = encryptOrKeep(draft.passphrase, original?.encryptedPassphrase),
             hostKeyFingerprint = if (draft.clearHostKeyFingerprint) ""
                 else draft.hostKeyFingerprint.ifBlank { original?.hostKeyFingerprint.orEmpty() },
-            platform = draft.platform,
             lastUsedAt = original?.lastUsedAt ?: 0,
         )
         if (saved.authType == AuthType.PASSWORD && saved.encryptedPassword.isBlank()) {

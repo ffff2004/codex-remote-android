@@ -8,9 +8,6 @@ import java.util.UUID
 enum class AuthType { PASSWORD, PRIVATE_KEY }
 
 @Serializable
-enum class RemotePlatform { AUTO, POSIX, WINDOWS }
-
-@Serializable
 data class SavedConnection(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
@@ -22,7 +19,6 @@ data class SavedConnection(
     val encryptedPrivateKey: String = "",
     val encryptedPassphrase: String = "",
     val hostKeyFingerprint: String = "",
-    val platform: RemotePlatform = RemotePlatform.AUTO,
     val lastUsedAt: Long = 0,
 )
 
@@ -38,7 +34,6 @@ data class ConnectionDraft(
     val passphrase: String = "",
     val hostKeyFingerprint: String = "",
     val clearHostKeyFingerprint: Boolean = false,
-    val platform: RemotePlatform = RemotePlatform.AUTO,
 )
 
 internal enum class ConnectionDraftIssue {
