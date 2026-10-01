@@ -225,6 +225,22 @@ class ThreadListPaginationTest {
     }
 
     @Test
+    fun continuesSuppliedFirstPageAndPublishesDeduplicatedProgress() = runBlocking {
+        val cursors = mutableListOf<String?>()
+        val snapshots = mutableListOf<List<String>>()
+        val threads = collectAllThreadPages(
+            firstPage = ThreadPage(listOf(thread("one", 30)), "tail"),
+            onPage = { snapshots += it.map { thread -> thread.id } },
+        ) { cursor ->
+            cursors += cursor
+            ThreadPage(listOf(thread("one", 40), thread("two", 20)), null)
+        }
+        assertEquals(listOf("tail"), cursors)
+        assertEquals(listOf(listOf("one"), listOf("one", "two")), snapshots)
+        assertEquals(40, threads.first().updatedAt)
+    }
+
+    @Test
     fun modelPaginationPreservesRemoteCatalogOrder() = runBlocking {
         val requestedCursors = mutableListOf<String?>()
 

@@ -125,13 +125,24 @@ class CodexRpcClient(
         )
     }
 
-    suspend fun listThreads(): List<RemoteThread> = listThreads(archived = false)
+    suspend fun listThreadPage(cursor: String? = null): ThreadPage = loadThreadPage(cursor, archived = false)
+
+    suspend fun listThreads(
+        firstPage: ThreadPage? = null,
+        onPage: suspend (List<RemoteThread>) -> Unit = {},
+    ): List<RemoteThread> = collectAllThreadPages(firstPage, onPage) { cursor ->
+        loadThreadPage(cursor, archived = false)
+    }
 
     suspend fun listArchivedThreads(): List<RemoteThread> = listThreads(archived = true)
 
     private suspend fun listThreads(archived: Boolean): List<RemoteThread> = collectAllThreadPages { cursor ->
+        loadThreadPage(cursor, archived)
+    }
+
+    private suspend fun loadThreadPage(cursor: String?, archived: Boolean): ThreadPage {
         val result = request("thread/list", threadListParams(cursor, archived))
-        ThreadPage(
+        return ThreadPage(
             threads = result.array("data").mapNotNull(::parseThread),
             nextCursor = result.string("nextCursor"),
         )
@@ -1402,7 +1413,7 @@ class CodexRpcClient(
     }
 }
 
-internal data class ThreadPage(
+data class ThreadPage(
     val threads: List<RemoteThread>,
     val nextCursor: String?,
 )
@@ -1413,13 +1424,17 @@ internal data class ModelPage(
 )
 
 internal suspend fun collectAllThreadPages(
+    firstPage: ThreadPage? = null,
+    onPage: suspend (List<RemoteThread>) -> Unit = {},
     loadPage: suspend (cursor: String?) -> ThreadPage,
 ): List<RemoteThread> {
     val threadsById = linkedMapOf<String, RemoteThread>()
     val usedCursors = mutableSetOf<String>()
     var cursor: String? = null
+    var suppliedPage = firstPage
     do {
-        val page = loadPage(cursor)
+        val page = suppliedPage ?: loadPage(cursor)
+        suppliedPage = null
         page.threads.forEach { thread ->
             val current = threadsById[thread.id]
             if (current == null || thread.updatedAt >= current.updatedAt) threadsById[thread.id] = thread
@@ -1428,6 +1443,7 @@ internal suspend fun collectAllThreadPages(
         if (cursor != null && !usedCursors.add(cursor)) {
             throw RpcException("thread/list 返回了重复的 nextCursor")
         }
+        onPage(threadsById.values.sortedWith(compareByDescending<RemoteThread> { it.updatedAt }.thenBy { it.id }))
     } while (cursor != null)
     return threadsById.values.sortedWith(compareByDescending<RemoteThread> { it.updatedAt }.thenBy { it.id })
 }

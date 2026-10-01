@@ -199,6 +199,7 @@ fun WorkspaceScreen(
     onSelectProject: (RemoteProject) -> Unit,
     onSelectThread: (RemoteThread) -> Unit,
     onLoadOlderHistory: () -> Unit,
+    onRetryThreads: () -> Unit,
     onRenameThread: (RemoteThread, String) -> Unit,
     onArchiveThread: (RemoteThread) -> Unit,
     onLoadArchivedThreads: () -> Unit,
@@ -269,6 +270,7 @@ fun WorkspaceScreen(
                         onLoadArchivedThreads()
                     },
                     onOpenConnections = onOpenConnections,
+                    onRetryThreads = onRetryThreads,
                 )
                 HorizontalDivider(Modifier.fillMaxHeight().width(1.dp))
                 WorkspaceContent(
@@ -338,6 +340,7 @@ fun WorkspaceScreen(
                                 onLoadArchivedThreads()
                                 scope.launch { drawerState.close() }
                             },
+                            onRetryThreads = onRetryThreads,
                             onOpenConnections = {
                                 scope.launch { drawerState.close() }
                                 onOpenConnections()
@@ -459,6 +462,7 @@ private fun WorkspaceSidebar(
     onSetThreadPinned: (RemoteThread, Boolean) -> Unit,
     onOpenArchivedTasks: () -> Unit,
     onOpenConnections: () -> Unit,
+    onRetryThreads: () -> Unit,
 ) {
     val expandedProjects = remember(state.activeConnection?.id) { mutableStateMapOf<String, Boolean>() }
     var searchQuery by remember(state.activeConnection?.id) { mutableStateOf("") }
@@ -509,11 +513,30 @@ private fun WorkspaceSidebar(
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (state.isThreadsLoading) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Loading more conversations…", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        state.threadsError?.let { error ->
+            Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp)) {
+                Text("Some conversations could not be loaded", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error)
+                Text(error, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                TextButton(onClick = onRetryThreads) { Text("Retry loading conversations") }
+            }
+        }
         LazyColumn(modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
             if (displayedProjects.isEmpty()) {
                 item(key = "empty-projects") {
                     Text(
-                        if (searchQuery.isBlank()) "No Codex conversations found" else "No matching tasks",
+                        if (state.isThreadsLoading) "Conversations are still loading"
+                        else if (state.threadsError != null && searchQuery.isBlank()) "Conversation list is incomplete"
+                        else if (searchQuery.isBlank()) "No Codex conversations found" else "No matching tasks",
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 14.dp),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

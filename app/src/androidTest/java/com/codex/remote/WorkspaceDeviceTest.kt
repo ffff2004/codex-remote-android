@@ -19,6 +19,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
@@ -70,6 +71,24 @@ import kotlin.math.abs
 
 @RunWith(AndroidJUnit4::class)
 class WorkspaceDeviceTest {
+    @Test
+    fun partialHistoryShowsLoadingAndRetryWithoutHidingWorkspace() {
+        val state = mutableStateOf(baseState().copy(isThreadsLoading = true))
+        val callbacks = WorkspaceCallbacks()
+        var retries = 0
+        callbacks.onRetryThreads = { retries++ }
+        show(state, callbacks)
+        if (composeRule.onAllNodesWithText("Loading more conversations…").fetchSemanticsNodes().isEmpty()) {
+            composeRule.onNodeWithContentDescription("打开会话").performClick()
+        }
+        composeRule.onNodeWithText("Loading more conversations…").assertIsDisplayed()
+        composeRule.onNodeWithTag("composer-input").assertIsDisplayed()
+        composeRule.runOnIdle { state.value = state.value.copy(isThreadsLoading = false, threadsError = "fixture failure") }
+        composeRule.onNodeWithText("Some conversations could not be loaded").assertIsDisplayed()
+        composeRule.onNodeWithText("Retry loading conversations").performClick()
+        composeRule.runOnIdle { assertEquals(1, retries) }
+        composeRule.onNodeWithTag("composer-input").assertIsDisplayed()
+    }
     @get:Rule
     val composeRule = createAndroidComposeRule<ComponentActivity>()
 
@@ -460,6 +479,7 @@ val answer = 42
                     onSelectProject = {},
                     onSelectThread = {},
                     onLoadOlderHistory = callbacks.onLoadOlder,
+                    onRetryThreads = callbacks.onRetryThreads,
                     onRenameThread = { _, _ -> },
                     onArchiveThread = {},
                     onLoadArchivedThreads = {},
@@ -571,6 +591,7 @@ class RemoteStateDeviceTest {
 }
 
 private class WorkspaceCallbacks {
+    var onRetryThreads: () -> Unit = {}
     var collaborationMode: String? = null
     var permissionMode: PermissionMode? = null
     val sentMessages = mutableListOf<Pair<String, Boolean>>()

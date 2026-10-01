@@ -381,6 +381,8 @@ data class AppUiState(
     val connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED,
     val connectionMessage: String = "",
     val threads: List<RemoteThread> = emptyList(),
+    val isThreadsLoading: Boolean = false,
+    val threadsError: String? = null,
     val archivedThreads: List<RemoteThread> = emptyList(),
     val isArchivedThreadsLoading: Boolean = false,
     val archivedThreadsError: String? = null,

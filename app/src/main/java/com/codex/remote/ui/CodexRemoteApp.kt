@@ -41,6 +41,7 @@ fun CodexRemoteApp(viewModel: AppViewModel) {
             onSelectProject = viewModel::selectProject,
             onSelectThread = viewModel::selectThread,
             onLoadOlderHistory = viewModel::loadOlderHistory,
+            onRetryThreads = viewModel::retryThreads,
             onRenameThread = viewModel::renameThread,
             onArchiveThread = viewModel::archiveThread,
             onLoadArchivedThreads = viewModel::loadArchivedThreads,

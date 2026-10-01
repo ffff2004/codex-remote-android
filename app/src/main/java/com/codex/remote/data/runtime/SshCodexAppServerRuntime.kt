@@ -45,15 +45,24 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
     override suspend fun open(
         connection: SavedConnection,
         secrets: ConnectionSecrets,
-    ): AppServerSession = withContext(Dispatchers.IO) {
-        var ssh: SSHClient? = null
+    ): AppServerSession {
+        var opened: AppServerSession? = null
         try {
-            val client = authenticatedClient(connection, secrets)
-            ssh = client
-            val lifecycle = startDaemon(client)
-            openProxy(client, lifecycle)
+            return withContext(Dispatchers.IO) {
+                var ssh: SSHClient? = null
+                try {
+                    val client = authenticatedClient(connection, secrets)
+                    ssh = client
+                    val lifecycle = startDaemon(client)
+                    openProxy(client, lifecycle).also { opened = it }
+                } catch (error: Throwable) {
+                    closeSsh(ssh)
+                    throw error
+                }
+            }
         } catch (error: Throwable) {
-            closeSsh(ssh)
+            // withContext may cancel delivery after blocking SSH setup produced a live session.
+            opened?.close()
             throw error
         }
     }

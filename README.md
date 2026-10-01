@@ -38,6 +38,10 @@ listener is exposed.
 
 No project path is configured on Android. Existing projects and conversations
 come from the remote Codex history returned by `thread/list`.
+The first page is shown as soon as the connection is ready; remaining history
+loads in the background and is merged into the project list. The sidebar shows
+loading progress and offers a retry if a later page fails, keeping already
+loaded conversations available.
 Opening a conversation resumes its live app-server subscription while loading
 only the latest five full turns; older turns are fetched as the chat is scrolled
 to the top, with a legacy full-history fallback for older Codex hosts.

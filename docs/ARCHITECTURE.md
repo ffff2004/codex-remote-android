@@ -87,6 +87,17 @@ Projects are a UI projection of the returned threads grouped by normalized
 uses that thread's own `cwd`. Starting a conversation uses the selected imported
 project's path.
 
+Connection readiness requires protocol initialization, account/model data,
+initial collaboration/permission options and the first thread page. The client
+publishes that page immediately, then follows
+the remaining cursors in the background using the same filesystem-backed query
+to preserve history completeness. Each accumulated page is deduplicated and
+merged without invalidating the current conversation. Later-page failures keep
+the connection usable and expose a separate sidebar retry. Thread refreshes
+coalesce during an active listing; local edits and archive tombstones remain
+authoritative for that pass. Disconnecting or changing hosts cancels the old
+listing and prevents its results from updating the new connection.
+
 The model picker is populated exclusively from the remote `model/list` catalog,
 including each model's reasoning choices, input modalities, service tiers and
 defaults. Plan mode comes from `collaborationMode/list`; permissions come from
