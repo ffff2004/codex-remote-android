@@ -312,8 +312,13 @@ internal suspend fun pumpAppServerMessages(
     }
 }
 
+/**
+ * The SSH login shell parses this command string before anything runs, so it must stay shell-agnostic:
+ * no `${...}` expansion (fish rejects it with exit 127). `/bin/sh -lc` is a POSIX login shell that
+ * resolves the user's login PATH.
+ */
 internal fun daemonStartCommand(): String =
-    "exec \"\${SHELL:-/bin/sh}\" -lc " +
+    "exec /bin/sh -lc " +
         DaemonLifecycle.posixQuote("exec codex app-server daemon start")
 
 /**
@@ -326,8 +331,9 @@ internal fun androidCompatibleSshConfig() = DefaultSecurityProviderConfig().appl
     }
 }
 
+/** Same shell-agnostic contract as [daemonStartCommand]; the socket path is quoted for the inner and outer shell. */
 internal fun daemonProxyCommand(socketPath: String): String =
-    "exec \"\${SHELL:-/bin/sh}\" -lc " +
+    "exec /bin/sh -lc " +
         DaemonLifecycle.posixQuote(
             "exec codex app-server proxy --sock " + DaemonLifecycle.posixQuote(socketPath),
         )

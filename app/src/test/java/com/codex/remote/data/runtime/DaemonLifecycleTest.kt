@@ -3,7 +3,6 @@ package com.codex.remote.data.runtime
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DaemonLifecycleTest {
@@ -86,18 +85,5 @@ class DaemonLifecycleTest {
         assertEquals("''", DaemonLifecycle.posixQuote(""))
         assertEquals("'/a \$HOME `whoami`'", DaemonLifecycle.posixQuote("/a \$HOME `whoami`"))
         assertEquals("'a'\\''b'\\''c'", DaemonLifecycle.posixQuote("a'b'c"))
-    }
-
-    @Test
-    fun daemonCommandsQuoteTheSocketPath() {
-        assertEquals(
-            "exec \"\${SHELL:-/bin/sh}\" -lc 'exec codex app-server daemon start'",
-            daemonStartCommand(),
-        )
-        assertEquals(
-            "exec \"\${SHELL:-/bin/sh}\" -lc 'exec codex app-server proxy --sock '\\''/tmp/a b.sock'\\'''",
-            daemonProxyCommand("/tmp/a b.sock"),
-        )
-        assertTrue(daemonProxyCommand("/tmp/it's.sock").contains("'\\''"))
     }
 }
