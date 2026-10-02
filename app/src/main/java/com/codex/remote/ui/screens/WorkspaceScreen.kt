@@ -165,6 +165,7 @@ import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerTriggerKind
 import com.codex.remote.domain.FileChangeSummary
 import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.FullAccessTarget
 import com.codex.remote.domain.TaskComposer
 import com.codex.remote.domain.TaskIndicator
 import com.codex.remote.domain.PermissionMode
@@ -247,9 +248,13 @@ fun WorkspaceScreen(
     onCancelFullAccess: () -> Unit = {},
 ) {
     state.fullAccessConfirmation?.let { confirmation ->
+        val scopeText = when (val target = confirmation.target) {
+            is FullAccessTarget.ExistingThread -> "仅对任务 ${target.threadId} 启用完全访问。"
+            is FullAccessTarget.Draft -> "仅对当前 New Task 草稿（项目 ${target.projectPath}）启用完全访问，用于创建任务和首个 turn。"
+        }
         AlertDialog(onDismissRequest = onCancelFullAccess,
             title = { Text("确认完全访问") },
-            text = { Text("仅对任务 ${confirmation.threadId} 启用完全访问。Codex 将无需逐项审批即可读写文件和执行命令。" +
+            text = { Text(scopeText + "Codex 将无需逐项审批即可读写文件和执行命令。" +
                 if (state.isTurnRunning) " 当前 turn 保持原权限；下个 turn 生效。" else "") },
             confirmButton = { TextButton(onClick = { onConfirmFullAccess(confirmation) }) { Text("确认完全访问") } },
             dismissButton = { TextButton(onClick = onCancelFullAccess) { Text("取消") } })

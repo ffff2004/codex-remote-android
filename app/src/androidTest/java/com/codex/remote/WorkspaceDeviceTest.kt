@@ -43,6 +43,7 @@ import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.FileChangeSummary
 import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.FullAccessTarget
 import com.codex.remote.domain.TaskComposer
 import com.codex.remote.domain.TaskIndicator
 import com.codex.remote.domain.PermissionMode
@@ -516,12 +517,23 @@ val answer = 42
     }
 
     @Test fun fullAccessDialogExplainsScopeAndPassesCapturedConfirmation() {
-        val confirmation = FullAccessConfirmation(7, "tester@host:22", "thread-a")
+        val confirmation = FullAccessConfirmation(7, "tester@host:22", FullAccessTarget.ExistingThread("thread-a"))
         val state = mutableStateOf(baseState(isTurnRunning = true).copy(fullAccessConfirmation = confirmation))
         val callbacks = WorkspaceCallbacks()
         show(state, callbacks)
         composeRule.onNodeWithText("仅对任务 thread-a", substring = true).assertIsDisplayed()
         composeRule.onNodeWithText("下个 turn", substring = true).assertIsDisplayed()
+        composeRule.onAllNodesWithText("确认完全访问")[1].performClick()
+        composeRule.runOnIdle { assertEquals(confirmation, callbacks.confirmation) }
+    }
+
+    @Test fun draftFullAccessDialogShowsProjectFirstTurnAndCapturedIdentity() {
+        val confirmation = FullAccessConfirmation(7, "tester@host:22", FullAccessTarget.Draft(11, "/fixture/project"))
+        val state = mutableStateOf(baseState().copy(selectedThreadId = null, fullAccessConfirmation = confirmation))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+        composeRule.onNodeWithText("当前 New Task 草稿（项目 /fixture/project）", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("用于创建任务和首个 turn", substring = true).assertIsDisplayed()
         composeRule.onAllNodesWithText("确认完全访问")[1].performClick()
         composeRule.runOnIdle { assertEquals(confirmation, callbacks.confirmation) }
     }

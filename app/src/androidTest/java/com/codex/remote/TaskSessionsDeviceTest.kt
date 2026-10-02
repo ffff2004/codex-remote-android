@@ -8,6 +8,7 @@ import com.codex.remote.data.runtime.*
 import com.codex.remote.data.store.ConnectionStore
 import com.codex.remote.domain.*
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
@@ -22,6 +23,324 @@ import org.junit.runner.RunWith
 /** In-memory public AppServerSession injection; these are not SSH/daemon integration tests. */
 @RunWith(AndroidJUnit4::class)
 class TaskSessionsDeviceTest {
+    @Test fun confirmedDraftUsesCapturedSettingsOnWireAndReturnedTaskAndNextDraftIsSafe() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val confirmation = vm.state.value.fullAccessConfirmation!!
+            assertEquals(FullAccessTarget.Draft(vm.state.value.taskSelectionEpoch, "/fixture/a"), confirmation.target)
+            onMain {
+                vm.updateComposer(null, TaskComposer("edited after dialog", 5))
+                vm.setModel("second")
+                vm.confirmFullAccess(confirmation)
+                vm.updateComposer(null, TaskComposer("edited after grant", 9))
+            }
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            onMain { vm.sendMessage("first authorized turn") }
+            val start = receive(session.starts)
+            assertPermissions(start, ":danger-full-access", "never")
+            assertEquals("second", start["params"]!!.jsonObject["model"]!!.jsonPrimitive.content)
+            // Remote/default model metadata must not overwrite the accepted operation's settings.
+            session.respond(start, created("draft-created", model = "model"))
+            val turn = receive(session.turnWrites)
+            assertPermissions(turn, ":danger-full-access", "never")
+            assertEquals("second", turn["params"]!!.jsonObject["model"]!!.jsonPrimitive.content)
+            assertEquals("draft-created", turn["params"]!!.jsonObject["threadId"]!!.jsonPrimitive.content)
+            await(vm) { it.selectedThreadId == "draft-created" }
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            assertEquals("never", vm.state.value.approvalPolicy)
+            assertEquals("user", vm.state.value.approvalsReviewer)
+            assertEquals("second", vm.state.value.selectedModel)
+            finishTurn(vm, session, turn, "draft-created")
+            onMain { vm.newThread(); vm.sendMessage("second safe draft") }
+            val safeStart = receive(session.starts)
+            assertPermissions(safeStart, ":workspace", "on-request")
+            session.respond(safeStart, created("safe-created"))
+            val safeTurn = receive(session.turnWrites)
+            assertPermissions(safeTurn, ":workspace", "on-request")
+            finishTurn(vm, session, safeTurn, "safe-created")
+            assertEquals(2, session.startWrites)
+            // A resume describing broad desktop access must preserve the locally accepted safe profile.
+            onMain { vm.selectThread(RemoteThread("safe-created", "safe", "/fixture/a", 1, "")) }
+            session.respond(receive(session.resumes), snapshot("safe-created", "remote", remoteGrant = true))
+            await(vm) { !it.isGoalLoading && it.timeline.any { i -> i.body == "remote" } }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+        }
+    }
+
+    @Test fun cancelledAndStaleDraftConfirmationsCannotAuthorizeRepeatedDraftsOrSwitchBack() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val cancelled = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.cancelFullAccess(); vm.confirmFullAccess(cancelled) }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            onMain { vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val repeated = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.newThread(); vm.confirmFullAccess(repeated) }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            onMain { vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!) }
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            onMain { vm.newThread() }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            onMain { vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val switched = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.confirmFullAccess(switched) }
+            open(vm, session, "b")
+            onMain { vm.selectProject(vm.state.value.projects.first { it.path == "/fixture/a" }); vm.confirmFullAccess(switched) }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            assertNull(vm.state.value.fullAccessConfirmation)
+            onMain { vm.sendMessage("safe after switch back") }
+            val start = receive(session.starts)
+            assertPermissions(start, ":workspace", "on-request")
+            session.respond(start, created("safe-switch"))
+            val turn = receive(session.turnWrites)
+            assertPermissions(turn, ":workspace", "on-request")
+            finishTurn(vm, session, turn, "safe-switch")
+        }
+    }
+
+    @Test fun projectChangeInvalidatesBothPendingConfirmationAndConfirmedDraftGrant() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val pending = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.selectProject(vm.state.value.projects.first { it.path == "/fixture/b" }); vm.confirmFullAccess(pending) }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            onMain { vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!) }
+            onMain { vm.selectProject(vm.state.value.projects.first { it.path == "/fixture/a" }); vm.sendMessage("safe project") }
+            val start = receive(session.starts)
+            assertPermissions(start, ":workspace", "on-request")
+            session.respond(start, created("safe-project"))
+            val turn = receive(session.turnWrites)
+            assertPermissions(turn, ":workspace", "on-request")
+            finishTurn(vm, session, turn, "safe-project")
+        }
+    }
+
+    @Test fun permissionDowngradesInvalidateDraftGrantsAndOpenDialogs() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            val downgrades: List<Pair<String, () -> Unit>> = listOf(
+                ":read-only" to { vm.setPermissionMode(PermissionMode.READ_ONLY) },
+                ":workspace" to { vm.setPermissionMode(PermissionMode.AUTO_REVIEW) },
+                ":workspace" to { vm.setPermissionProfile(":workspace") },
+            )
+            downgrades.forEachIndexed { index, (profile, downgrade) ->
+                onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+                val granted = vm.state.value.fullAccessConfirmation!!
+                onMain { vm.confirmFullAccess(granted); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+                val pending = vm.state.value.fullAccessConfirmation!!
+                onMain { downgrade(); vm.confirmFullAccess(pending); vm.confirmFullAccess(granted); vm.sendMessage("downgrade $index") }
+                val start = receive(session.starts)
+                val reviewer = if (index == 1) "auto_review" else "user"
+                assertPermissions(start, profile, "on-request", reviewer)
+                session.respond(start, created("downgraded-$index"))
+                val turn = receive(session.turnWrites)
+                assertPermissions(turn, profile, "on-request", reviewer)
+                finishTurn(vm, session, turn, "downgraded-$index")
+                assertEquals(profile, vm.state.value.selectedPermissionProfile)
+            }
+        }
+    }
+
+    @Test fun lateAuthorizedCreationKeepsOriginalGrantWithoutSelectingOverNewerDraft() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!); vm.setModel("second"); vm.sendMessage("original") }
+            val start = receive(session.starts)
+            onMain { vm.newThread(); vm.updateComposer(null, TaskComposer("newer draft")); vm.setPermissionMode(PermissionMode.READ_ONLY) }
+            val epoch = vm.state.value.taskSelectionEpoch
+            session.respond(start, created("late-authorized"))
+            val turn = receive(session.turnWrites)
+            assertPermissions(start, ":danger-full-access", "never")
+            assertPermissions(turn, ":danger-full-access", "never")
+            assertEquals("late-authorized", turn["params"]!!.jsonObject["threadId"]!!.jsonPrimitive.content)
+            assertEquals("second", turn["params"]!!.jsonObject["model"]!!.jsonPrimitive.content)
+            assertNull(vm.state.value.selectedThreadId)
+            assertEquals(epoch, vm.state.value.taskSelectionEpoch)
+            assertEquals("newer draft", vm.state.value.composer.text)
+            assertEquals(":read-only", vm.state.value.selectedPermissionProfile)
+            finishTurn(vm, session, turn, "late-authorized")
+            onMain { vm.selectThread(RemoteThread("late-authorized", "original", "/fixture/a", 1, "")) }
+            session.respond(receive(session.resumes), snapshot("late-authorized", "original resumed"))
+            await(vm) { !it.isGoalLoading }
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            assertEquals("never", vm.state.value.approvalPolicy)
+            assertEquals("second", vm.state.value.selectedModel)
+            onMain { vm.sendMessage("next original turn") }
+            val next = receive(session.turnWrites)
+            assertPermissions(next, ":danger-full-access", "never")
+            finishTurn(vm, session, next, "late-authorized")
+        }
+    }
+
+    @Test fun disconnectAndSameHostReconnectRejectDraftGrantAndLateCreationWithoutReplay() = runBlocking<Unit> {
+        val first = TaskSession(); val recovered = TaskSession()
+        withViewModel(listOf(first, recovered)) { vm, session ->
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val confirmation = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.confirmFullAccess(confirmation); vm.sendMessage("old connection") }
+            val start = receive(session.starts)
+            val saved = vm.state.value.activeConnection!!
+            onMain { vm.disconnect() }
+            await(vm) { it.activeConnection == null }
+            onMain { vm.connect(saved) }
+            await(vm) { it.connectionStatus == ConnectionStatus.CONNECTED && it.models.isNotEmpty() }
+            session.respond(start, created("old-connection-thread"))
+            onMain { vm.confirmFullAccess(confirmation) }
+            delay(150)
+            assertNull(vm.state.value.selectedThreadId)
+            assertFalse(vm.state.value.taskIndicators.containsKey("old-connection-thread"))
+            assertTrue(recovered.starts.tryReceive().isFailure)
+            assertTrue(session.turnWrites.tryReceive().isFailure)
+            onMain { vm.sendMessage("manual safe send") }
+            val safe = receive(recovered.starts)
+            assertPermissions(safe, ":workspace", "on-request")
+            recovered.respond(safe, created("reconnected-safe"))
+            val turn = receive(recovered.turnWrites)
+            assertPermissions(turn, ":workspace", "on-request")
+            finishTurn(vm, recovered, turn, "reconnected-safe")
+        }
+    }
+
+    @Test fun savedHostAndTrustEditsInvalidateDraftsAndDispatchedCreationEvenAfterRestoringIdentity() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as Application
+            val store = ConnectionStore(app)
+            val original = vm.state.value.activeConnection!!
+            for (changeHost in listOf(false, true)) {
+                onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+                val confirmation = vm.state.value.fullAccessConfirmation!!
+                onMain { vm.confirmFullAccess(confirmation); vm.sendMessage("old context") }
+                val start = receive(session.starts)
+                val changed = store.save(ConnectionDraft(id = original.id, name = original.name,
+                    host = if (changeHost) "changed.invalid" else original.host, username = original.username,
+                    hostKeyFingerprint = if (changeHost) original.hostKeyFingerprint else "SHA256:new-trust"), original)
+                await(vm) { it.activeConnection?.host == changed.host && it.activeConnection?.hostKeyFingerprint == changed.hostKeyFingerprint }
+                assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+                assertNull(vm.state.value.fullAccessConfirmation)
+                store.save(ConnectionDraft(id = original.id, name = original.name, host = original.host,
+                    username = original.username, hostKeyFingerprint = original.hostKeyFingerprint, clearHostKeyFingerprint = true), changed)
+                await(vm) { it.activeConnection?.host == original.host && it.activeConnection?.hostKeyFingerprint == original.hostKeyFingerprint }
+                onMain { vm.confirmFullAccess(confirmation) }
+                session.respond(start, created("old-context-$changeHost"))
+                delay(150)
+                assertNull(vm.state.value.selectedThreadId)
+                assertFalse(vm.state.value.taskIndicators.containsKey("old-context-$changeHost"))
+                assertTrue(session.turnWrites.tryReceive().isFailure)
+            }
+        }
+    }
+
+    @Test fun unsentGrantAndDialogCannotSurviveHostTrustEditsAndReconnectToAnotherHost() = runBlocking<Unit> {
+        val first = TaskSession(); val other = TaskSession()
+        withViewModel(listOf(first, other)) { vm, session ->
+            val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as Application
+            val store = ConnectionStore(app)
+            val original = vm.state.value.activeConnection!!
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val old = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.confirmFullAccess(old); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val pending = vm.state.value.fullAccessConfirmation!!
+            val changed = store.save(ConnectionDraft(id = original.id, name = original.name, host = original.host,
+                username = original.username, hostKeyFingerprint = "SHA256:unsent-trust"), original)
+            await(vm) { it.activeConnection?.hostKeyFingerprint == changed.hostKeyFingerprint }
+            assertNull(vm.state.value.fullAccessConfirmation)
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            store.save(ConnectionDraft(id = original.id, name = original.name, host = original.host,
+                username = original.username, clearHostKeyFingerprint = true), changed)
+            await(vm) { it.activeConnection?.hostKeyFingerprint == original.hostKeyFingerprint }
+            onMain { vm.confirmFullAccess(old); vm.confirmFullAccess(pending); vm.sendMessage("safe restored trust") }
+            val safe = receive(session.starts)
+            assertPermissions(safe, ":workspace", "on-request")
+            session.respond(safe, created("safe-trust"))
+            val safeTurn = receive(session.turnWrites)
+            assertPermissions(safeTurn, ":workspace", "on-request")
+            finishTurn(vm, session, safeTurn, "safe-trust")
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val another = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.confirmFullAccess(another); vm.connect(original.copy(id = "draft-other-host", host = "other.invalid"), preserveTaskState = true) }
+            await(vm) { it.connectionStatus == ConnectionStatus.CONNECTED && it.activeConnection?.host == "other.invalid" }
+            onMain { vm.confirmFullAccess(another); vm.sendMessage("safe other host") }
+            val start = receive(other.starts)
+            assertPermissions(start, ":workspace", "on-request")
+            other.respond(start, created("safe-other-host"))
+            val turn = receive(other.turnWrites)
+            assertPermissions(turn, ":workspace", "on-request")
+            finishTurn(vm, other, turn, "safe-other-host")
+        }
+    }
+
+    @Test fun reconstructedOwnerDoesNotRestoreDraftContentOrFullAccess() = runBlocking<Unit> {
+        withViewModel { vm, _ ->
+            onMain {
+                vm.newThread(); vm.updateComposer(null, TaskComposer("private draft"))
+                vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!)
+            }
+            val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as Application
+            val restartedSession = TaskSession()
+            val holder = ViewModelStore()
+            lateinit var restarted: AppViewModel
+            onMain { restarted = AppViewModel(app, AppServerRuntime { _, _ -> restartedSession }); holder.put("draft-restart", restarted) }
+            try {
+                await(restarted) { it.connectionStatus == ConnectionStatus.CONNECTED && it.models.isNotEmpty() }
+                assertNull(restarted.state.value.selectedThreadId)
+                assertNull(restarted.state.value.fullAccessConfirmation)
+                assertEquals("", restarted.state.value.composer.text)
+                onMain { restarted.sendMessage("manual first send after reconstruction") }
+                val start = receive(restartedSession.starts)
+                assertPermissions(start, ":workspace", "on-request")
+                restartedSession.respond(start, created("reconstructed-safe"))
+                val turn = receive(restartedSession.turnWrites)
+                assertPermissions(turn, ":workspace", "on-request")
+                finishTurn(restarted, restartedSession, turn, "reconstructed-safe")
+            } finally { onMain { restarted.disconnect(); holder.clear() } }
+        }
+    }
+
+    @Test fun failedAuthorizedCreationAndFirstTurnRemainManualWithoutReplayingWrites() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!); vm.sendMessage("uncertain creation") }
+            val start = receive(session.starts)
+            assertPermissions(start, ":danger-full-access", "never")
+            session.emit(buildJsonObject { put("id", start.getValue("id")); put("error", obj("""{"message":"creation outcome unknown"}""")) })
+            await(vm) { it.notice?.contains("Delivery uncertain") == true }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            assertNull(vm.state.value.selectedThreadId)
+            delay(100)
+            assertTrue(session.starts.tryReceive().isFailure)
+            assertTrue(session.turnWrites.tryReceive().isFailure)
+            onMain { vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!); vm.sendMessage("manual new authorization") }
+            val manual = receive(session.starts)
+            assertPermissions(manual, ":danger-full-access", "never")
+            session.respond(manual, created("uncertain-first-turn"))
+            val turn = receive(session.turnWrites)
+            assertPermissions(turn, ":danger-full-access", "never")
+            session.emit(buildJsonObject { put("id", turn.getValue("id")); put("error", obj("""{"message":"turn outcome unknown"}""")) })
+            await(vm) { it.timeline.any { item -> item.status == "delivery uncertain" } }
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            assertEquals("never", vm.state.value.approvalPolicy)
+            delay(100)
+            assertTrue(session.starts.tryReceive().isFailure)
+            assertTrue(session.turnWrites.tryReceive().isFailure)
+            assertEquals(1, session.startWrites)
+        }
+    }
+
+    private fun assertPermissions(write: JsonObject, profile: String, policy: String, reviewer: String = "user") {
+        val params = write["params"]!!.jsonObject
+        assertEquals(profile, params["permissions"]!!.jsonPrimitive.content)
+        assertEquals(policy, params["approvalPolicy"]!!.jsonPrimitive.content)
+        assertEquals(reviewer, params["approvalsReviewer"]!!.jsonPrimitive.content)
+        assertFalse(params.containsKey("sandboxPolicy"))
+    }
+
+    private fun created(id: String, model: String = "model") = obj("""{"thread":{"id":"$id","cwd":"/fixture/a"},"model":"$model"}""")
+
+    private suspend fun finishTurn(vm: AppViewModel, session: TaskSession, write: JsonObject, owner: String) {
+        val turnId = "turn-${write["id"]!!.jsonPrimitive.content}"
+        session.respond(write, obj("""{"turn":{"id":"$turnId"}}"""))
+        await(vm) { it.taskIndicators[owner]?.running == true }
+        session.turn(owner, turnId, false)
+        await(vm) { it.taskIndicators[owner]?.running == false }
+    }
+
     @Test fun backgroundEventsAndCompletionBeforeResponseKeepOriginalOwner() = runBlocking<Unit> {
         withViewModel { vm, session ->
             open(vm, session, "a")
@@ -197,14 +516,17 @@ class TaskSessionsDeviceTest {
     @Test fun outgoingNewThreadResponseCannotSelectOrSendToAnotherTask() = runBlocking<Unit> {
         withViewModel { vm, session ->
             open(vm, session, "a")
-            onMain { vm.newThread(); vm.sendMessage("new task prompt") }
+            onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!); vm.sendMessage("new task prompt") }
             val start = receive(session.starts)
+            assertPermissions(start, ":danger-full-access", "never")
             open(vm, session, "b")
             session.respond(start, obj("""{"thread":{"id":"new-task"},"cwd":"/fixture/a","model":"model"}"""))
             val turn = receive(session.turnWrites)
+            assertPermissions(turn, ":danger-full-access", "never")
             assertEquals("new-task", turn["params"]!!.jsonObject["threadId"]!!.jsonPrimitive.content)
             assertEquals("b", vm.state.value.selectedThreadId)
             assertFalse(vm.state.value.timeline.any { it.body == "new task prompt" })
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
             session.respond(turn, obj("""{"turn":{"id":"new-turn"}}"""))
             await(vm) { it.taskIndicators["new-task"]?.running == true }
             assertEquals("b", vm.state.value.selectedThreadId)

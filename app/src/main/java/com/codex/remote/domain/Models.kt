@@ -365,7 +365,19 @@ data class TaskRecoveryTarget(val threadId: String, val cwd: String, val running
 
 data class TaskIndicator(val running: Boolean = false, val approval: Boolean = false, val failed: Boolean = false, val unread: Int = 0)
 
-data class FullAccessConfirmation(val connectionGeneration: Long, val hostKey: String, val threadId: String)
+sealed interface FullAccessTarget {
+    data class ExistingThread(val threadId: String) : FullAccessTarget
+    data class Draft(val selectionRevision: Long, val projectPath: String) : FullAccessTarget
+}
+
+data class FullAccessConfirmation(
+    val connectionGeneration: Long,
+    val hostKey: String,
+    val target: FullAccessTarget,
+) {
+    fun matches(generation: Long, host: String?, currentTarget: FullAccessTarget?): Boolean =
+        connectionGeneration == generation && hostKey == host && target == currentTarget
+}
 
 data class TaskComposer(val text: String = "", val cursor: Int = 0, val mentions: List<ComposerMention> = emptyList(), val attachments: List<ComposerImageAttachment> = emptyList(), val goalMode: Boolean = false)
 

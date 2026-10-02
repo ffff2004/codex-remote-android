@@ -27,6 +27,7 @@ import com.codex.remote.session.TurnStartResponseDisposition
 import com.codex.remote.session.retainedChars
 import com.codex.remote.session.reconcileSessionTimeline
 import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.FullAccessTarget
 import com.codex.remote.domain.TaskComposer
 import com.codex.remote.domain.TaskRecoveryTarget
 import com.codex.remote.domain.RemoteThreadSession
@@ -108,6 +109,8 @@ class AppViewModel @JvmOverloads constructor(
     }
     private var sessionHostKey: String? = null
     private var selectionRevision = 0L
+    private var draftFullAccessGrant: FullAccessConfirmation? = null
+    private var hostContextRevision = 0L
     private var pendingOperations = 0
     val hasRunningTasks: Boolean get() = sessions.sessions.values.any { it.isTurnRunning }
     val hasPendingApprovals: Boolean get() = _state.value.approvalQueue.entries.isNotEmpty()
@@ -140,6 +143,12 @@ class AppViewModel @JvmOverloads constructor(
                     null
                 }
                 val restoreConnection = connectionToRestore?.takeIf { _state.value.activeConnection == null }
+                val active = _state.value.activeConnection
+                val refreshed = connections.firstOrNull { it.id == active?.id }
+                if (refreshed != null && refreshed.exactSessionHostKey() != active?.exactSessionHostKey()) {
+                    hostContextRevision++
+                    invalidateDraftFullAccess()
+                }
                 _state.update { current ->
                     val refreshedActive = current.activeConnection?.let { active ->
                         connections.firstOrNull { it.id == active.id } ?: active
@@ -199,6 +208,7 @@ class AppViewModel @JvmOverloads constructor(
 
     fun connect(connection: SavedConnection, restoreSelectedTaskId: String? = null, preserveTaskState: Boolean = false, automaticRecovery: Boolean = false) {
         if (automaticRecovery && _state.value.recoveryBlocked) return
+        invalidateDraftFullAccess()
         if (!automaticRecovery) {
             _state.update { it.copy(recoveryBlocked = false) }
             if (maintenance?.connectRequested(connection) == false) {
@@ -398,6 +408,7 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     fun disconnect() {
+        invalidateDraftFullAccess()
         maintenance?.disconnectRequested()
         ++connectionGeneration
         connectionJob?.cancel()
@@ -405,6 +416,7 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     private fun disconnectInternal(clearActive: Boolean, preserveTaskState: Boolean = false) {
+        invalidateDraftFullAccess()
         requests.invalidateConnection()
         resumeEvents.reset()
         selectionRevision++
@@ -563,6 +575,7 @@ class AppViewModel @JvmOverloads constructor(
     fun selectThread(thread: RemoteThread) {
         if (_state.value.activeConnection == null) return
         val client = rpc ?: return
+        invalidateDraftFullAccess()
         saveSelectedProjection()
         abandonResume()
         requests.advanceSelection()
@@ -661,6 +674,11 @@ class AppViewModel @JvmOverloads constructor(
         val currentState = _state.value
         val ownerThreadId = currentState.selectedThreadId
         val ownerSelectionRevision = selectionRevision
+        val ownerGeneration = connectionGeneration
+        val ownerHostRevision = hostContextRevision
+        val ownerHostKey = currentState.activeConnection?.exactSessionHostKey()
+        fun ownsConnection() = rpc === client && connectionGeneration == ownerGeneration && hostContextRevision == ownerHostRevision &&
+            _state.value.activeConnection?.exactSessionHostKey() == ownerHostKey && sessionHostKey == ownerHostKey
         if (currentState.remoteAccount?.canRunCodex != true) {
             _state.update { it.copy(notice = "远端 Codex 尚未登录") }
             return
@@ -693,6 +711,18 @@ class AppViewModel @JvmOverloads constructor(
             _state.update { it.copy(notice = "请先选择一个远端项目") }
             return
         }
+        val draftGrant = if (ownerThreadId == null) draftFullAccessGrant?.takeIf {
+            it.matches(ownerGeneration, ownerHostKey, FullAccessTarget.Draft(ownerSelectionRevision, cwd))
+        } else null
+        if (ownerThreadId == null && permissionProfile == ":danger-full-access" && draftGrant == null) {
+            invalidateDraftFullAccess()
+            _state.update { it.copy(notice = "草稿授权已失效，请重新确认完全访问") }
+            return
+        }
+        val acceptedSettings = SessionSettings(model = selectedModel, reasoningEffort = selectedReasoningEffort,
+            serviceTier = selectedServiceTier, collaborationMode = currentState.selectedCollaborationMode,
+            permissionProfile = permissionProfile, approvalPolicy = approvalPolicy, approvalsReviewer = approvalsReviewer,
+            fullAccessGranted = draftGrant != null, locallyConfigured = true)
         val mentions = resolveComposerMentions(prompt, cwd, selectedMentions, currentState)
         val steeringThreadId = currentState.selectedThreadId.takeIf { currentState.isTurnRunning }
         val steeringTurnId = currentState.activeTurnId.takeIf { currentState.isTurnRunning }
@@ -700,7 +730,10 @@ class AppViewModel @JvmOverloads constructor(
             _state.update { it.copy(notice = "正在恢复运行中的任务，请等远端 turn id 同步后再追加消息") }
             return
         }
+        // The first accepted operation owns this grant. Later selection/settings edits cannot change it.
+        if (ownerThreadId == null) invalidateDraftFullAccess()
         viewModelScope.launch {
+            if (!ownsConnection()) return@launch
             val localItemId = "local-${UUID.randomUUID()}"
             val userItem = TimelineItem(id = localItemId, kind = TimelineKind.USER, clientId = localItemId,
                 status = if (asGoal) "" else "awaiting confirmation", turnId = steeringTurnId, body = buildString {
@@ -717,36 +750,34 @@ class AppViewModel @JvmOverloads constructor(
                 if (threadId == null) {
                     val started = client.startThread(cwd, selectedModel, selectedServiceTier, approvalPolicy,
                         approvalsReviewer, permissionProfile)
-                    if (rpc !== client) return@launch
+                    if (!ownsConnection()) return@launch
                     threadId = started.id
                     if (!acceptMutation(sessions.register(started.id, RemoteThread(started.id, prompt.take(100),
                             started.cwd, System.currentTimeMillis() / 1000, "")))) return@launch
-                    updateTask(started.id) { it.copy(settings = defaultTaskSettings().copy(
-                        model = started.model ?: selectedModel, reasoningEffort = selectedReasoningEffort,
-                        serviceTier = selectedServiceTier, collaborationMode = currentState.selectedCollaborationMode)) }
+                    if (!updateTask(started.id) { it.copy(settings = acceptedSettings) }) return@launch
                     if (selectionRevision == ownerSelectionRevision && _state.value.selectedThreadId == null) {
                         sessions.select(started.id)
                         publishSelectedSession()
                     }
                 }
                 val owner = threadId
-                if (rpc !== client || owner !in sessions.sessions) return@launch
+                if (!ownsConnection() || owner !in sessions.sessions) return@launch
                 if (!updateTask(owner, authoritative = false) { it.copy(timeline = it.timeline + userItem, liveRevision = it.liveRevision + 1,
                     pendingWrites = it.pendingWrites + 1, isTurnRunning = if (asGoal) it.isTurnRunning else true,
                     isGoalLoading = asGoal || it.isGoalLoading, goalError = if (asGoal) null else it.goalError,
                     composer = TaskComposer(), failed = false) }) return@launch
                 if (asGoal) {
                     val goal = client.setThreadGoal(owner, prompt, ThreadGoalStatus.ACTIVE)
-                    if (rpc === client) updateTask(owner) { it.copy(goal = goal, isGoalLoading = false, goalError = null) }
+                    if (ownsConnection()) updateTask(owner) { it.copy(goal = goal, isGoalLoading = false, goalError = null) }
                 } else if (steeringThreadId != null && steeringTurnId != null) {
                     val returnedTurnId = client.steerTurn(owner, steeringTurnId, prompt, mentions, attachments, localItemId)
-                    if (rpc === client && returnedTurnId != steeringTurnId) failSessionCapacity("Steer response changed exact turn ownership")
+                    if (ownsConnection() && returnedTurnId != steeringTurnId) failSessionCapacity("Steer response changed exact turn ownership")
                 } else {
                     startToken = requests.beginTurnStart(owner, localItemId)
                     val turnId = client.startTurn(owner, prompt, cwd, selectedModel, selectedReasoningEffort,
                         selectedServiceTier, approvalPolicy, approvalsReviewer, permissionProfile,
                         collaborationMode, mentions, attachments, localItemId)
-                    if (rpc === client) when (requests.resolveTurnStartResponse(startToken, turnId)) {
+                    if (ownsConnection()) when (requests.resolveTurnStartResponse(startToken, turnId)) {
                         TurnStartResponseDisposition.APPLY, TurnStartResponseDisposition.ALREADY_OBSERVED -> {
                             val task = sessions.sessions[owner]
                             if (task?.activeTurnId != null && task.activeTurnId != turnId)
@@ -758,7 +789,7 @@ class AppViewModel @JvmOverloads constructor(
                     }
                 }
             } catch (error: Throwable) {
-                if (rpc === client) {
+                if (ownsConnection()) {
                     val owner = threadId
                     if (owner != null && owner in sessions.sessions) updateTask(owner) { task ->
                         val rollback = startToken?.let(requests::canRollbackTurnStart) == true
@@ -773,8 +804,10 @@ class AppViewModel @JvmOverloads constructor(
                     _state.update { it.copy(notice = "${friendlyError(error)}. Delivery uncertain; this write will not be replayed.") }
                 }
             } finally {
-                if (rpc === client) {
+                if (rpc === client && connectionGeneration == ownerGeneration) {
                     pendingOperations = (pendingOperations - 1).coerceAtLeast(0)
+                }
+                if (ownsConnection()) {
                     threadId?.takeIf { it in sessions.sessions }?.let { owner ->
                         updateTask(owner) { it.copy(pendingWrites = (it.pendingWrites - 1).coerceAtLeast(0)) }
                     }
@@ -1294,6 +1327,7 @@ class AppViewModel @JvmOverloads constructor(
 
     fun setPermissionProfile(profileId: String?) {
         if (profileId == ":danger-full-access") { setPermissionMode(PermissionMode.FULL_ACCESS); return }
+        invalidateDraftFullAccess()
         _state.update { state ->
             if (profileId == null || profileId in BUILT_IN_PERMISSION_PROFILES ||
                 state.permissionProfiles.any { it.id == profileId && it.allowed })
@@ -1305,16 +1339,18 @@ class AppViewModel @JvmOverloads constructor(
     fun setPermissionMode(mode: PermissionMode) {
         val state = _state.value
         if (mode == PermissionMode.FULL_ACCESS) {
-            val owner = state.selectedThreadId
             val connection = state.activeConnection
-            if (owner == null || connection == null) {
-                _state.update { it.copy(notice = "请先创建或打开任务，再确认完全访问") }
+            val target = fullAccessTarget(state)
+            if (target == null || connection == null || rpc == null ||
+                state.connectionStatus != ConnectionStatus.CONNECTED || sessionHostKey != connection.exactSessionHostKey()) {
+                _state.update { it.copy(notice = "请先连接并选择任务或远端项目，再确认完全访问") }
                 return
             }
             _state.update { it.copy(fullAccessConfirmation = FullAccessConfirmation(connectionGeneration,
-                connection.exactSessionHostKey(), owner)) }
+                connection.exactSessionHostKey(), target)) }
             return
         }
+        invalidateDraftFullAccess()
         _state.update { it.copy(selectedPermissionProfile = if (mode == PermissionMode.READ_ONLY) ":read-only" else ":workspace",
             approvalPolicy = "on-request", approvalsReviewer = if (mode == PermissionMode.AUTO_REVIEW) "auto_review" else "user",
             notice = if (it.isTurnRunning) "权限更改将在下个 turn 生效" else null) }
@@ -1548,6 +1584,7 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     private fun leaveSelection() {
+        invalidateDraftFullAccess()
         saveSelectedProjection()
         abandonResume()
         requests.advanceSelection()
@@ -1565,23 +1602,47 @@ class AppViewModel @JvmOverloads constructor(
 
     fun confirmFullAccess(confirmation: FullAccessConfirmation) {
         val state = _state.value
-        if (state.fullAccessConfirmation != confirmation || confirmation.connectionGeneration != connectionGeneration ||
-            state.activeConnection?.exactSessionHostKey() != confirmation.hostKey ||
-            state.selectedThreadId != confirmation.threadId) {
+        if (state.fullAccessConfirmation != confirmation || rpc == null || state.connectionStatus != ConnectionStatus.CONNECTED ||
+            sessionHostKey != confirmation.hostKey || !confirmation.matches(connectionGeneration,
+                state.activeConnection?.exactSessionHostKey(), fullAccessTarget(state))) {
             _state.update { it.copy(fullAccessConfirmation = null, notice = "任务选择已变化，请重新确认权限") }
             return
         }
-        updateTask(confirmation.threadId, authoritative = false) { it.copy(settings = it.settings.copy(
-            permissionProfile = ":danger-full-access", approvalPolicy = "never", approvalsReviewer = "user",
-            fullAccessGranted = true, locallyConfigured = true)) }
+        when (val target = confirmation.target) {
+            is FullAccessTarget.ExistingThread -> updateTask(target.threadId, authoritative = false) { it.copy(settings = it.settings.copy(
+                permissionProfile = ":danger-full-access", approvalPolicy = "never", approvalsReviewer = "user",
+                fullAccessGranted = true, locallyConfigured = true)) }
+            is FullAccessTarget.Draft -> {
+                draftFullAccessGrant = confirmation
+                _state.update { it.copy(selectedPermissionProfile = ":danger-full-access", approvalPolicy = "never",
+                    approvalsReviewer = "user") }
+            }
+        }
         _state.update { it.copy(fullAccessConfirmation = null,
-            notice = if (it.isTurnRunning) "完全访问已确认；下个 turn 生效" else "完全访问已对当前任务确认") }
+            notice = if (it.isTurnRunning) "完全访问已确认；下个 turn 生效"
+                else if (confirmation.target is FullAccessTarget.Draft) "完全访问已对当前草稿确认；用于创建任务和首个 turn"
+                else "完全访问已对当前任务确认") }
     }
 
     fun cancelFullAccess() = _state.update { it.copy(fullAccessConfirmation = null) }
 
+    private fun fullAccessTarget(state: AppUiState): FullAccessTarget? = state.selectedThreadId?.let {
+        FullAccessTarget.ExistingThread(it)
+    } ?: state.selectedProjectPath?.takeIf { it.isNotBlank() }?.let { FullAccessTarget.Draft(selectionRevision, it) }
+
+    private fun invalidateDraftFullAccess() {
+        draftFullAccessGrant = null
+        _state.update { state ->
+            if (state.selectedThreadId == null && state.selectedPermissionProfile == ":danger-full-access")
+                state.copy(fullAccessConfirmation = null, selectedPermissionProfile = ":workspace",
+                    approvalPolicy = "on-request", approvalsReviewer = "user")
+            else state.copy(fullAccessConfirmation = null)
+        }
+    }
+
     /** Stage3 can close the transport and preserve exact cached selection for authoritative recovery. */
     fun closeForRecovery() {
+        invalidateDraftFullAccess()
         ++connectionGeneration
         connectionJob?.cancel()
         saveSelectedProjection()
