@@ -49,6 +49,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -622,7 +623,7 @@ class CodexRpcClient(
                 put("id", Json.parseToJsonElement(id.value))
                 put("params", params)
             })
-            val result = deferred.await()
+            val result = withTimeout(60_000) { deferred.await() }
             recordOwnerDirectories(method, result)
             return result
         } finally {
@@ -682,7 +683,7 @@ class CodexRpcClient(
         } catch (error: Throwable) {
             _events.emit(AppServerEvent.Failure(error.message ?: "SSH 数据流已中断"))
         } finally {
-            val error = RpcException("远端连接已关闭")
+            val error = com.codex.remote.data.runtime.AppServerException.AppServerConnectionLost("远端连接已关闭")
             pending.values.forEach { it.completeExceptionally(error) }
             pending.clear()
         }
@@ -1519,6 +1520,8 @@ class CodexRpcClient(
     override fun close() {
         readerJob?.cancel()
         scope.cancel()
+        pending.values.forEach { it.completeExceptionally(com.codex.remote.data.runtime.AppServerException.AppServerConnectionLost("远端连接已关闭")) }
+        pending.clear()
         session.close()
     }
 }

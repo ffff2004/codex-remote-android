@@ -6,6 +6,7 @@ import com.codex.remote.domain.ConnectionSecrets
 import com.codex.remote.domain.SavedConnection
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -47,12 +48,11 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
         secrets: ConnectionSecrets,
     ): AppServerSession {
         var opened: AppServerSession? = null
+        val ssh = SSHClient(androidCompatibleSshConfig())
         try {
-            return withContext(Dispatchers.IO) {
-                var ssh: SSHClient? = null
+            return blockingIo(45_000, abort = { closeSsh(ssh) }) {
                 try {
-                    val client = authenticatedClient(connection, secrets)
-                    ssh = client
+                    val client = authenticatedClient(ssh, connection, secrets)
                     val lifecycle = startDaemon(client)
                     openProxy(client, lifecycle).also { opened = it }
                 } catch (error: Throwable) {
@@ -68,10 +68,10 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
     }
 
     private fun authenticatedClient(
+        ssh: SSHClient,
         connection: SavedConnection,
         secrets: ConnectionSecrets,
     ): SSHClient {
-        val ssh = SSHClient(androidCompatibleSshConfig())
         var unknownFingerprint: String? = null
         var changedFingerprint: String? = null
         ssh.connectTimeout = CONNECT_TIMEOUT_MILLIS
@@ -208,6 +208,7 @@ class SshCodexAppServerRuntime(private val context: Context) : AppServerRuntime 
 
     private fun closeSsh(ssh: SSHClient?) {
         ssh ?: return
+        runCatching { ssh.socket?.close() }
         runCatching { ssh.disconnect() }
         runCatching { ssh.close() }
     }
@@ -261,16 +262,26 @@ private class SshAppServerSession(
         if (closed.get()) throw closedException()
         sendMutex.withLock {
             if (closed.get()) throw closedException()
-            webSocket.sendText(json.encodeToString(JsonObject.serializer(), message))
+            // Once a frame begins, finish it within its deadline. Cancelling an obsolete
+            // catalog/read caller must not truncate a frame or close the shared session.
+            // Owner/session close still closes the socket immediately and unblocks this IO.
+            withContext(NonCancellable) {
+                blockingIo(15_000, abort = { close() }) {
+                    webSocket.sendTextBlocking(json.encodeToString(JsonObject.serializer(), message))
+                }
+            }
         }
     }
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         scope.cancel()
+        // Close the TCP socket before channel/stream locks or a graceful frame write.
+        runCatching { ssh.socket?.close() }
         runCatching { webSocket.close() }
         runCatching { command.close() }
         runCatching { session.close() }
+        runCatching { ssh.socket?.close() }
         runCatching { ssh.disconnect() }
         runCatching { ssh.close() }
     }

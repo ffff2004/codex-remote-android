@@ -15,6 +15,8 @@ from typing import Any
 
 import paramiko
 
+from ssh_fixture_control import FixtureControl
+
 
 RICH_MARKDOWN_REPLY = r"""## 远端渲染检查
 
@@ -305,6 +307,9 @@ class DaemonState:
         }
 
 
+HISTORY_PAGE_DELAY_SECONDS = 0.0
+
+
 class MockAppServer:
     def __init__(self, transport: WebSocketTransport, events: EventLog) -> None:
         self.transport = transport
@@ -329,6 +334,7 @@ class MockAppServer:
                 "updatedAt": 1785100100,
             },
         ]
+        self.current_turns: dict[str, str] = {}
         self.turn_counter = 0
         self.pending_approval_turn: tuple[str, str] | None = None
         self.goals: dict[str, dict[str, Any]] = {}
@@ -341,6 +347,8 @@ class MockAppServer:
         self.send({"id": request["id"], "result": result})
 
     def notification(self, method: str, params: dict[str, Any]) -> None:
+        if method.startswith("item/") and params.get("threadId") in self.current_turns:
+            params.setdefault("turnId", self.current_turns[params["threadId"]])
         self.send({"method": method, "params": params})
 
     def run(self) -> None:
@@ -396,6 +404,7 @@ class MockAppServer:
                 self.events.write("protocol_violation", detail="thread/list must not contain cwd")
             cursor = params.get("cursor")
             if cursor == "page-2":
+                time.sleep(HISTORY_PAGE_DELAY_SECONDS)
                 page = self.threads[2:]
                 next_cursor = None
             else:
@@ -619,6 +628,7 @@ class MockAppServer:
         self.turn_counter += 1
         turn_id = f"turn-{self.turn_counter}"
         thread_id = request.get("params", {}).get("threadId", "thread-android")
+        self.current_turns[thread_id] = turn_id
         prompt = "\n".join(
             item.get("text", "") for item in request.get("params", {}).get("input", []) if item.get("type") == "text"
         )
@@ -634,6 +644,7 @@ class MockAppServer:
                 "item": {
                     "type": "userMessage",
                     "id": f"user-{self.turn_counter}",
+                    "clientId": request.get("params", {}).get("clientUserMessageId"),
                     "content": [{"type": "text", "text": prompt}],
                 },
             },
@@ -644,7 +655,7 @@ class MockAppServer:
                 {
                     "id": 9001,
                     "method": "item/commandExecution/requestApproval",
-                    "params": {"command": "git status --short", "reason": "Verify Android approval UI"},
+                    "params": {"threadId": thread_id, "turnId": turn_id, "itemId": f"command-{self.turn_counter}", "command": "git status --short", "cwd": "/workspace/demo", "reason": "Verify Android approval UI"},
                 }
             )
             return
@@ -866,9 +877,11 @@ def handle_client(
     password: str,
     daemon: DaemonState,
     events: EventLog,
+    control: FixtureControl,
 ) -> None:
     events.write("connection_open", peer=f"{peer[0]}:{peer[1]}")
     transport = paramiko.Transport(client)
+    control.add(transport)
     transport.get_security_options().kex = ("diffie-hellman-group14-sha256",)
     transport.add_server_key(host_key)
     server = MockSshServer(username, password, events)
@@ -907,23 +920,29 @@ def handle_client(
         events.write("connection_error", error=type(error).__name__, detail=str(error))
     finally:
         transport.close()
+        control.remove(transport)
         client.close()
         events.write("connection_closed", peer=f"{peer[0]}:{peer[1]}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--history-page-delay", type=float, default=0.0)
+    parser.add_argument("--control-port", type=int, help="Optional loopback-only forced-loss test endpoint")
     parser.add_argument("--port", type=int, default=22222)
     parser.add_argument("--username", default="codex-test")
     parser.add_argument("--password", default="codex-test")
     parser.add_argument("--state-dir", type=Path, required=True)
     args = parser.parse_args()
+    global HISTORY_PAGE_DELAY_SECONDS
+    HISTORY_PAGE_DELAY_SECONDS = args.history_page_delay
 
     args.state_dir.mkdir(parents=True, exist_ok=True)
     events_path = args.state_dir / "events.jsonl"
     events_path.write_text("", encoding="utf-8")
     events = EventLog(events_path)
+    control = FixtureControl(args.control_port, events)
     host_key = load_or_create_host_key(args.state_dir / "host_rsa_key")
     daemon = DaemonState(MOCK_SOCKET_PATH)
 
@@ -943,7 +962,7 @@ def main() -> None:
             client, peer = listener.accept()
             threading.Thread(
                 target=handle_client,
-                args=(client, peer, host_key, args.username, args.password, daemon, events),
+                args=(client, peer, host_key, args.username, args.password, daemon, events, control),
                 daemon=True,
             ).start()
     except KeyboardInterrupt:

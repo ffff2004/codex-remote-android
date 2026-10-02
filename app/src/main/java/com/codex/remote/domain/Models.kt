@@ -435,6 +435,8 @@ data class AppUiState(
     val approvalQueue: ApprovalQueue = ApprovalQueue(),
     val approvalFileItems: Map<ApprovalFileItemKey, TimelineItem> = emptyMap(),
     val pendingHostKeyFingerprint: String? = null,
+    val maintenanceStatus: String? = null,
+    val recoveryApprovalWarning: String? = null,
     val isRestoringLastConnection: Boolean = true,
     val showConnections: Boolean = false,
     val showConnectionEditor: Boolean = false,

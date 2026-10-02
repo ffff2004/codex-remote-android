@@ -386,7 +386,7 @@ class TaskSessionsDeviceTest {
         } finally { onMain { vm.disconnect(); holder.clear() }; store.delete(connection.id) }
     }
 
-    private class TaskSession(private val firstPageIds: List<String> = listOf("a", "b")) : AppServerSession {
+    internal class TaskSession(private val firstPageIds: List<String> = listOf("a", "b")) : AppServerSession {
         override val version = CodexRuntimeVersion("fixture", "fixture")
         private val incoming = Channel<JsonObject>(Channel.UNLIMITED)
         override val messages = incoming.receiveAsFlow()
@@ -433,14 +433,14 @@ class TaskSessionsDeviceTest {
     }
 
     companion object {
-        private fun obj(text: String) = Json.parseToJsonElement(text).jsonObject
-        private fun listPage(ids: List<String>, cursor: String?) = buildJsonObject {
+        internal fun obj(text: String) = Json.parseToJsonElement(text).jsonObject
+        internal fun listPage(ids: List<String>, cursor: String?) = buildJsonObject {
             put("data", buildJsonArray { ids.forEach { id -> add(buildJsonObject {
                 put("id", id); put("name", id); put("cwd", "/fixture/$id"); put("updatedAt", 1)
             }) } })
             put("nextCursor", cursor?.let(::JsonPrimitive) ?: JsonNull)
         }
-        private fun snapshot(id: String, body: String, activeTurn: String? = null, remoteGrant: Boolean = false) = buildJsonObject {
+        internal fun snapshot(id: String, body: String, activeTurn: String? = null, remoteGrant: Boolean = false) = buildJsonObject {
             put("thread", buildJsonObject { put("id", id); put("cwd", "/fixture/$id"); put("status", buildJsonObject { put("type", if (activeTurn == null) "idle" else "active") }) })
             put("model", "model")
             if (remoteGrant) { put("activePermissionProfile", buildJsonObject { put("id", ":danger-full-access") }); put("approvalPolicy", "never") }

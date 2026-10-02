@@ -83,6 +83,8 @@ import java.util.UUID
 class AppViewModel @JvmOverloads constructor(
     application: Application,
     private val runtime: AppServerRuntime = SshCodexAppServerRuntime(application),
+    private val restoreLastConnection: Boolean = true,
+    private val maintenance: com.codex.remote.connection.ConnectionMaintenance? = null,
 ) : AndroidViewModel(application) {
     private val store = ConnectionStore(application)
     private val _state = MutableStateFlow(AppUiState())
@@ -129,7 +131,7 @@ class AppViewModel @JvmOverloads constructor(
         viewModelScope.launch {
             store.connections.collect { connections ->
                 val sortedConnections = connections.sortedByDescending { it.lastUsedAt }
-                val connectionToRestore = if (!didRestoreLastConnection) {
+                val connectionToRestore = if (restoreLastConnection && !didRestoreLastConnection) {
                     didRestoreLastConnection = true
                     sortedConnections.lastUsedConnectionOrNull()
                 } else {
@@ -188,15 +190,31 @@ class AppViewModel @JvmOverloads constructor(
 
     fun deleteConnection(connection: SavedConnection) {
         viewModelScope.launch {
-            if (_state.value.activeConnection?.id == connection.id) disconnect()
+            if (_state.value.activeConnection?.id == connection.id || maintenance?.isDesiredConnection(connection.id) == true) disconnect()
             store.delete(connection.id)
         }
     }
 
-    fun connect(connection: SavedConnection, restoreSelectedTaskId: String? = null, preserveTaskState: Boolean = false) {
+    fun connect(connection: SavedConnection, restoreSelectedTaskId: String? = null, preserveTaskState: Boolean = false, automaticRecovery: Boolean = false) {
+        if (automaticRecovery && _state.value.recoveryBlocked) return
+        if (!automaticRecovery) {
+            _state.update { it.copy(recoveryBlocked = false) }
+            if (maintenance?.connectRequested(connection) == false) {
+                ++connectionGeneration
+                connectionJob?.cancel()
+                disconnectInternal(clearActive = false)
+                _state.update { it.copy(activeConnection = connection, connectionStatus = ConnectionStatus.CONNECTING,
+                    connectionMessage = "等待网络或设备唤醒后连接…", showConnections = false) }
+                return
+            }
+        }
         val generation = ++connectionGeneration
-        connectionJob?.cancel()
+        val previous = connectionJob
+        previous?.cancel()
+        rpc?.close()
         connectionJob = viewModelScope.launch {
+            previous?.join()
+            if (generation != connectionGeneration) return@launch
             val keep = preserveTaskState && sessionHostKey == connection.exactSessionHostKey()
             disconnectInternal(clearActive = false, preserveTaskState = keep)
             sessionHostKey = connection.exactSessionHostKey()
@@ -253,14 +271,17 @@ class AppViewModel @JvmOverloads constructor(
                     isStatusLoading = false,
                     statusError = null,
                     pendingHostKeyFingerprint = null,
-                    notice = null,
-                    recoveryBlocked = false,
+                    notice = if (keep) it.recoveryApprovalWarning else null,
+                    recoveryApprovalWarning = if (keep) it.recoveryApprovalWarning else null,
+                    recoveryBlocked = if (automaticRecovery) it.recoveryBlocked else false,
                     fullAccessConfirmation = null,
                 )
             }
+            if (keep) publishSelectedSession()
             runCatching {
                 val secrets = withContext(Dispatchers.IO) { store.decrypt(connection) }
                 val session = runtime.open(connection, secrets)
+                if (generation != connectionGeneration) { session.close(); throw CancellationException("Stale dial") }
                 val client = CodexRpcClient(session)
                 rpc = client
                 observeEvents(client)
@@ -278,7 +299,9 @@ class AppViewModel @JvmOverloads constructor(
                 ConnectionBootstrap(server, account, models, firstPage, collaborationModes, permissionProfiles)
             }.onSuccess { bootstrap ->
                 if (generation != connectionGeneration) return@onSuccess
-                val threads = bootstrap.firstPage.threads
+                val threads = (bootstrap.firstPage.threads + if (keep) sessions.sessions.values
+                    .filter { it.protected || it.threadId == sessions.selectedThreadId }
+                    .mapNotNull { it.thread } else emptyList()).distinctBy { it.id }
                 val projects = groupThreadsByProject(threads)
                 val selectedModel = bootstrap.models.firstOrNull { model -> model.isDefault }
                     ?: bootstrap.models.firstOrNull()
@@ -327,6 +350,7 @@ class AppViewModel @JvmOverloads constructor(
                     generation != connectionGeneration) return@onFailure
                 rpc?.close()
                 rpc = null
+                maintenance?.dialFailed(error)
                 val unknownHostKey = generateSequence(error) { it.cause }
                     .filterIsInstance<UnknownHostKeyException>()
                     .firstOrNull()
@@ -370,6 +394,7 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     fun disconnect() {
+        maintenance?.disconnectRequested()
         ++connectionGeneration
         connectionJob?.cancel()
         viewModelScope.launch { disconnectInternal(clearActive = true) }
@@ -448,9 +473,19 @@ class AppViewModel @JvmOverloads constructor(
                 taskIndicators = emptyMap(),
                 composer = TaskComposer(),
                 fullAccessConfirmation = null,
+                recoveryApprovalWarning = if (preserveTaskState) it.recoveryApprovalWarning else null,
             )
         }
     }
+
+    suspend fun awaitConnectionAttempt() { connectionJob?.join() }
+
+    suspend fun checkConnectionHealth() {
+        val client = rpc ?: return
+        withTimeout(10_000) { client.listThreadPage() }
+    }
+
+    fun setMaintenanceStatus(message: String?) = _state.update { it.copy(maintenanceStatus = message) }
 
     fun newThread() {
         if (_state.value.remoteAccount?.canRunCodex == true &&
@@ -1377,11 +1412,12 @@ class AppViewModel @JvmOverloads constructor(
             rpc === client && requests.isCurrent(token)
         } catch (error: Throwable) {
             if (rpc === client && requests.isCurrent(token)) { abandonResume(); showError(error) }
+            if (error is CancellationException) throw error
             false
         } finally { if (rpc === client) pendingOperations = (pendingOperations - 1).coerceAtLeast(0) }
     }
 
-    private fun SavedConnection.exactSessionHostKey(): String = "$id:$username@$host:$port"
+    private fun SavedConnection.exactSessionHostKey(): String = listOf(id, username, host, port.toString(), hostKeyFingerprint).joinToString("\u0000")
 
     private fun defaultTaskSettings(): SessionSettings {
         val model = _state.value.models.firstOrNull { it.isDefault } ?: _state.value.models.firstOrNull()
@@ -1522,6 +1558,10 @@ class AppViewModel @JvmOverloads constructor(
         ++connectionGeneration
         connectionJob?.cancel()
         saveSelectedProjection()
+        val approvals = _state.value.approvalQueue.entries
+        if (approvals.isNotEmpty()) _state.update { it.copy(recoveryApprovalWarning =
+            "Disconnected with ${approvals.size} pending/uncertain approval(s). Delivery cannot be confirmed; no response will be retried. Check the owning tasks on the server before authorizing new requests. " +
+                approvals.joinToString("; ") { entry -> "${entry.request.threadId ?: "unknown owner"} / ${entry.key.requestId}: ${entry.delivery}" }) }
         disconnectInternal(clearActive = false, preserveTaskState = true)
     }
 
@@ -1616,6 +1656,7 @@ class AppViewModel @JvmOverloads constructor(
                 }
             }
             is AppServerEvent.Failure -> {
+                maintenance?.transportLost()
                 closeForRecovery()
                 _state.update { it.copy(connectionStatus = ConnectionStatus.ERROR,
                     connectionMessage = event.message, notice = event.message) }
@@ -1848,7 +1889,7 @@ class AppViewModel @JvmOverloads constructor(
         is AppServerException.WebSocketHandshakeFailed ->
             "与远端 app-server 的 WebSocket 握手失败：${error.detail}。请确认远端 Codex 安装完整后重试。"
         is AppServerException.AppServerConnectionLost ->
-            "远端 app-server 连接已断开：${error.detail}。远端任务可能仍在运行，请手动重连。"
+            "远端 app-server 连接已断开：${error.detail}。远端任务可能仍在运行。"
     }
 
     override fun onCleared() {

@@ -26,6 +26,8 @@ from typing import Any
 
 import paramiko
 
+from ssh_fixture_control import FixtureControl, ClientRpcAudit
+
 
 class EventLog:
     def __init__(self, path: Path) -> None:
@@ -141,7 +143,7 @@ def bridge_daemon_start(channel: paramiko.Channel, codex: str, events: EventLog)
     events.write("daemon_start", exit_status=completed.returncode)
 
 
-def pump_channel_to_process(channel: paramiko.Channel, process: subprocess.Popen[bytes]) -> None:
+def pump_channel_to_process(channel: paramiko.Channel, process: subprocess.Popen[bytes], audit: ClientRpcAudit) -> None:
     try:
         while process.poll() is None and not channel.closed:
             try:
@@ -152,6 +154,7 @@ def pump_channel_to_process(channel: paramiko.Channel, process: subprocess.Popen
                 break
             if process.stdin is None:
                 break
+            audit.receive(chunk)
             process.stdin.write(chunk)
             process.stdin.flush()
     except (EOFError, OSError):
@@ -190,7 +193,7 @@ def bridge_proxy(
     )
     events.write("proxy_started", pid=process.pid, socket_path=socket_path)
     channel.settimeout(1.0)
-    workers = [threading.Thread(target=pump_channel_to_process, args=(channel, process), daemon=True)]
+    workers = [threading.Thread(target=pump_channel_to_process, args=(channel, process, ClientRpcAudit(events, channel.get_id())), daemon=True)]
     if process.stdout is not None:
         workers.append(threading.Thread(target=pump_process_stream, args=(process.stdout, channel.sendall), daemon=True))
     if process.stderr is not None:
@@ -260,9 +263,11 @@ def handle_client(
     password: str,
     codex: str,
     events: EventLog,
+    control: FixtureControl,
 ) -> None:
     events.write("connection_open", peer=f"{peer[0]}:{peer[1]}")
     transport = paramiko.Transport(client)
+    control.add(transport)
     transport.get_security_options().kex = ("diffie-hellman-group14-sha256",)
     transport.add_server_key(host_key)
     server = BridgeSshServer(username, password, events)
@@ -284,6 +289,7 @@ def handle_client(
         events.write("connection_error", error=type(error).__name__, detail=str(error))
     finally:
         transport.close()
+        control.remove(transport)
         client.close()
         events.write("connection_closed", peer=f"{peer[0]}:{peer[1]}")
 
@@ -294,6 +300,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=22223)
     parser.add_argument("--username", default="codex-real")
     parser.add_argument("--password", default="codex-real")
+    parser.add_argument("--control-port", type=int, help="Optional loopback-only forced-loss test endpoint")
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--codex", default="codex", help="Codex executable name or path")
     args = parser.parse_args()
@@ -303,6 +310,7 @@ def main() -> None:
     events_path = args.state_dir / "events.jsonl"
     events_path.write_text("", encoding="utf-8")
     events = EventLog(events_path)
+    control = FixtureControl(args.control_port, events)
     host_key = load_or_create_host_key(args.state_dir / "host_rsa_key")
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -330,6 +338,7 @@ def main() -> None:
                     args.password,
                     codex,
                     events,
+                    control,
                 ),
                 daemon=True,
             ).start()
