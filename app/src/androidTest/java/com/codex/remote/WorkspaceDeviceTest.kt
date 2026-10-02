@@ -13,6 +13,8 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -30,6 +32,11 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.codex.remote.data.rpc.CodexRpcClient
 import com.codex.remote.data.store.ConnectionStore
+import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalRequest
+import com.codex.remote.domain.ApprovalQueue
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.RpcRequestId
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.AuthType
 import com.codex.remote.domain.ComposerImageAttachment
@@ -71,6 +78,51 @@ import kotlin.math.abs
 
 @RunWith(AndroidJUnit4::class)
 class WorkspaceDeviceTest {
+    @Test
+    fun backgroundApprovalShowsExactOwnerAndOnlyAllowsDeny() {
+        val request = approvalFor("thread-background")
+        val state = mutableStateOf(baseState().copy(approvalQueue = ApprovalQueue().enqueue(request)))
+        val callbacks = WorkspaceCallbacks()
+        var denied: ApprovalQueueKey? = null
+        callbacks.onApproval = { key, decision, _ -> if (decision == "decline") denied = key }
+        show(state, callbacks)
+        composeRule.onNodeWithText("Thread: thread-background").assertIsDisplayed()
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("Deny").assertIsEnabled().performClick()
+        assertEquals(state.value.approvalQueue.currentEntry!!.key, denied)
+    }
+
+    @Test
+    fun approvalACompletionKeepsBVisibleWithItsOwnCallbackIdentity() {
+        val owner = baseState().selectedThreadId!!
+        val queue = ApprovalQueue().enqueue(approvalFor(owner)).enqueue(approvalFor(owner).copy(requestId = RpcRequestId.Text("B"), title = "Second approval"))
+        val state = mutableStateOf(baseState().copy(approvalQueue = queue))
+        val callbacks = WorkspaceCallbacks()
+        callbacks.onApproval = { key, _, _ -> state.value = state.value.copy(approvalQueue = state.value.approvalQueue.complete(key)) }
+        show(state, callbacks)
+        composeRule.onNodeWithText("Allow once").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Second approval").assertIsDisplayed()
+        composeRule.runOnIdle { state.value = state.value.copy(approvalQueue = state.value.approvalQueue.complete(queue.currentEntry!!.key)) }
+        composeRule.onNodeWithText("Second approval").assertIsDisplayed()
+    }
+
+    @Test
+    fun missingFileReviewCannotBeAuthorizedDespiteConversationChanges() {
+        val owner = baseState().selectedThreadId!!
+        val request = approvalFor(owner).copy(kind = ApprovalKind.FILE_CHANGE, title = "Review missing patch", rawMethod = "item/fileChange/requestApproval")
+        val state = mutableStateOf(baseState().copy(approvalQueue = ApprovalQueue().enqueue(request),
+            timeline = listOf(TimelineItem("some-other-item", TimelineKind.FILE_CHANGE, fileChanges = listOf(FileChangeSummary("a.kt", "update", "+safe"))))))
+        show(state)
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("Deny").assertIsEnabled()
+    }
+
+    private fun approvalFor(owner: String) = ApprovalRequest(
+        requestId = RpcRequestId.Text("A"), kind = ApprovalKind.COMMAND, title = "First approval", detail = "git status",
+        rawMethod = "item/commandExecution/requestApproval", threadId = owner, turnId = "turn-a", itemId = "command-a",
+        availableDecisions = listOf("accept", "decline"),
+    )
+
     @Test
     fun partialHistoryShowsLoadingAndRetryWithoutHidingWorkspace() {
         val state = mutableStateOf(baseState().copy(isThreadsLoading = true))
@@ -511,7 +563,7 @@ val answer = 42
                     onClearRemoteDirectory = {},
                     onStartLogin = {},
                     onCancelLogin = {},
-                    onApproval = { _, _ -> },
+                    onApproval = callbacks.onApproval,
                     onTrustHostKey = {},
                     onRejectHostKey = {},
                     onDismissNotice = {},
@@ -591,6 +643,7 @@ class RemoteStateDeviceTest {
 }
 
 private class WorkspaceCallbacks {
+    var onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit = { _, _, _ -> }
     var onRetryThreads: () -> Unit = {}
     var collaborationMode: String? = null
     var permissionMode: PermissionMode? = null

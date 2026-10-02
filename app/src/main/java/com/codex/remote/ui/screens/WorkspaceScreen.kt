@@ -154,6 +154,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.ApprovalDelivery
+import com.codex.remote.domain.canRespond
 import com.codex.remote.domain.ConnectionStatus
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.ComposerMentionKind
@@ -231,7 +234,7 @@ fun WorkspaceScreen(
     onClearRemoteDirectory: () -> Unit,
     onStartLogin: () -> Unit,
     onCancelLogin: () -> Unit,
-    onApproval: (String, Map<String, List<String>>) -> Unit,
+    onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit,
     onTrustHostKey: () -> Unit,
     onRejectHostKey: () -> Unit,
     onDismissNotice: () -> Unit,
@@ -388,10 +391,17 @@ fun WorkspaceScreen(
         }
     }
 
-    state.pendingApproval?.let { approval ->
+    state.approvalQueue.currentEntry?.let { entry ->
+        val approval = entry.request
         ApprovalDialog(
             approval = approval,
-            onDecision = onApproval,
+            selectedThreadId = state.selectedThreadId,
+            ownerTitle = state.threads.firstOrNull { it.id == approval.threadId }?.title,
+            delivery = entry.delivery,
+            queueCount = state.approvalQueue.entries.size,
+            onSelectOwner = state.threads.firstOrNull { it.id == approval.threadId }?.let { owner -> { onSelectThread(owner) } },
+            onDisconnect = { onApproval(entry.key, "disconnect", emptyMap()) },
+            onDecision = { decision, answers -> onApproval(entry.key, decision, answers) },
         )
     }
     state.pendingHostKeyFingerprint?.let { fingerprint ->
@@ -3923,77 +3933,74 @@ private fun ConnectionState(
 @Composable
 private fun ApprovalDialog(
     approval: com.codex.remote.domain.ApprovalRequest,
+    selectedThreadId: String?,
+    ownerTitle: String?,
+    delivery: ApprovalDelivery,
+    queueCount: Int,
+    onSelectOwner: (() -> Unit)?,
+    onDisconnect: () -> Unit,
     onDecision: (String, Map<String, List<String>>) -> Unit,
 ) {
-    val answers = remember(approval.requestId) {
-        mutableStateMapOf<String, String>().apply {
-            approval.questions.forEach { question ->
-                this[question.id] = question.options.firstOrNull().orEmpty()
-            }
-        }
-    }
+    val answers = remember(approval.requestId) { mutableStateMapOf<String, String>() }
+    val answerMap = answers.mapValues { listOf(it.value) }
+    val pending = delivery == ApprovalDelivery.PENDING
     AlertDialog(
         onDismissRequest = {},
-        icon = {
-            Icon(
-                if (approval.kind == ApprovalKind.FILE_CHANGE) Icons.Outlined.Code else Icons.Outlined.Terminal,
-                contentDescription = null,
-            )
-        },
         title = { Text(approval.title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(approval.detail, style = MaterialTheme.typography.bodyMedium)
-                if (approval.kind == ApprovalKind.USER_INPUT) {
-                    approval.questions.forEach { question ->
-                        if (question.header.isNotBlank()) {
-                            Text(question.header, style = MaterialTheme.typography.labelLarge)
+            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Owner: ${ownerTitle ?: approval.threadId ?: "Unknown task"}")
+                approval.threadId?.let { Text("Thread: $it", style = MonoText) }
+                Text("$queueCount pending request(s)")
+                if (approval.threadId == null || selectedThreadId != approval.threadId) {
+                    Text("Select the exact owner task to Allow. Deny remains available.")
+                    onSelectOwner?.let { select -> TextButton(onClick = select) { Text("Select owner task") } }
+                }
+                if (delivery == ApprovalDelivery.SENDING) Text("Sending response…")
+                if (delivery == ApprovalDelivery.UNCERTAIN) Text("Delivery uncertain. This response cannot be retried. Check the remote task before taking further action.")
+                Text(approval.detail)
+                approval.context.forEach { field ->
+                    Text(field.label, style = MaterialTheme.typography.labelLarge)
+                    SelectionContainer { Text(field.value, style = MonoText) }
+                }
+                approval.fileChanges.forEach { change ->
+                    Text("${change.kind}: ${change.path}${change.movePath?.let { " → $it" }.orEmpty()}")
+                    SelectionContainer { Text(change.diff, style = MonoText) }
+                }
+                if (!approval.canApprove(emptyList())) Text("Details are incomplete or exceed the review budget. Allow is disabled.")
+                approval.questions.forEach { question ->
+                    Text(question.header, style = MaterialTheme.typography.labelLarge)
+                    Text(question.question)
+                    question.options.forEach { option ->
+                        TextButton(onClick = { answers[question.id] = option.label }, enabled = pending) {
+                            Column { Text((if (answers[question.id] == option.label) "✓ " else "") + option.label); Text(option.description) }
                         }
-                        Text(question.question, style = MaterialTheme.typography.bodyMedium)
-                        question.options.forEach { option ->
-                            val selected = answers[question.id] == option
-                            Row(
-                                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
-                                    .selectable(selected = selected, onClick = { answers[question.id] = option })
-                                    .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
-                                    .padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                if (selected) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(17.dp))
-                                else Spacer(Modifier.width(17.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(option)
-                            }
-                        }
-                        OutlinedTextField(
-                            value = answers[question.id].orEmpty(),
-                            onValueChange = { answers[question.id] = it },
-                            label = { Text("Response") },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
                     }
-                } else {
-                    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(5.dp)) {
-                        SelectionContainer {
-                            Text(approval.detail, Modifier.fillMaxWidth().padding(10.dp), style = MonoText)
-                        }
+                    if (question.options.isEmpty() || question.isOther) {
+                        OutlinedTextField(value = answers[question.id].orEmpty(), onValueChange = { answers[question.id] = it },
+                            label = { Text(if (question.isOther) "Other / response" else "Response") }, enabled = pending)
                     }
                 }
             }
         },
         confirmButton = {
-            Button(onClick = {
-                onDecision("accept", answers.mapValues { listOf(it.value) })
-            }, enabled = approval.kind != ApprovalKind.USER_INPUT || answers.values.all { it.isNotBlank() }) {
-                Text(if (approval.kind == ApprovalKind.USER_INPUT) "Send" else "Allow once")
+            Column {
+                approval.availableDecisions.filter { it.startsWith("accept") }.forEach { decision ->
+                    Button(onClick = { onDecision(decision, answerMap) }, enabled = pending && approval.canRespond(selectedThreadId, decision, answerMap)) {
+                        Text(if (approval.kind == ApprovalKind.USER_INPUT) "Send" else if (decision == "acceptForSession") "Allow session" else "Allow once")
+                    }
+                }
             }
         },
         dismissButton = {
             Row {
-                TextButton(onClick = { onDecision("decline", emptyMap()) }) { Text("Deny") }
-                if (approval.kind == ApprovalKind.COMMAND || approval.kind == ApprovalKind.FILE_CHANGE) {
-                    TextButton(onClick = { onDecision("acceptForSession", emptyMap()) }) { Text("Allow session") }
+                approval.availableDecisions.filter { it == "decline" || it == "cancel" }.forEach { decision ->
+                    TextButton(onClick = { onDecision(decision, emptyMap()) }, enabled = pending) { Text(if (decision == "cancel") "Cancel task" else "Deny") }
                 }
+                if (approval.availableDecisions.none { it == "decline" || it == "cancel" }) {
+                    TextButton(onClick = onDisconnect, enabled = pending) { Text("Disconnect") }
+                }
+                if (delivery == ApprovalDelivery.UNCERTAIN) TextButton(onClick = { onDecision("dismiss", emptyMap()) }) { Text("Acknowledge") }
             }
         },
     )

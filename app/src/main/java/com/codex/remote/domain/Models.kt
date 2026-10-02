@@ -344,33 +344,15 @@ data class TimelineItem(
     val expanded: Boolean = false,
     val fileChanges: List<FileChangeSummary> = emptyList(),
     val isGoal: Boolean = false,
+    val turnId: String? = null,
+    val fileChangesComplete: Boolean = false,
 )
 
 data class FileChangeSummary(
     val path: String,
     val kind: String,
     val diff: String,
-)
-
-enum class ApprovalKind { COMMAND, FILE_CHANGE, PERMISSION, USER_INPUT, UNKNOWN }
-
-enum class PermissionMode { ASK, AUTO_REVIEW, FULL_ACCESS, READ_ONLY }
-
-data class ApprovalQuestion(
-    val id: String,
-    val header: String,
-    val question: String,
-    val options: List<String> = emptyList(),
-)
-
-data class ApprovalRequest(
-    val requestId: String,
-    val kind: ApprovalKind,
-    val title: String,
-    val detail: String,
-    val rawMethod: String,
-    val rawParams: String = "{}",
-    val questions: List<ApprovalQuestion> = emptyList(),
+    val movePath: String? = null,
 )
 
 enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
@@ -433,7 +415,8 @@ data class AppUiState(
     val approvalPolicy: String = "on-request",
     val isTurnRunning: Boolean = false,
     val activeTurnId: String? = null,
-    val pendingApproval: ApprovalRequest? = null,
+    val approvalQueue: ApprovalQueue = ApprovalQueue(),
+    val approvalFileItems: Map<ApprovalFileItemKey, TimelineItem> = emptyMap(),
     val pendingHostKeyFingerprint: String? = null,
     val isRestoringLastConnection: Boolean = true,
     val showConnections: Boolean = false,

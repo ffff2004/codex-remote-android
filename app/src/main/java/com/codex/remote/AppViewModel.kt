@@ -13,6 +13,14 @@ import com.codex.remote.data.runtime.UnknownHostKeyException
 import com.codex.remote.data.store.ConnectionStore
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalQueue
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.ApprovalDelivery
+import com.codex.remote.domain.ApprovalEnqueueStatus
+import com.codex.remote.domain.ApprovalFileItemKey
+import com.codex.remote.domain.canRespond
+import com.codex.remote.domain.fileApprovalSnapshotOrNull
+import com.codex.remote.domain.approvalFileSnapshotRetainedCharCount
 import com.codex.remote.domain.ConnectionDraft
 import com.codex.remote.domain.ConnectionStatus
 import com.codex.remote.domain.ComposerMention
@@ -368,7 +376,8 @@ class AppViewModel @JvmOverloads constructor(
                 statusError = null,
                 isTurnRunning = false,
                 activeTurnId = null,
-                pendingApproval = null,
+                approvalQueue = ApprovalQueue(),
+                approvalFileItems = emptyMap(),
                 pendingHostKeyFingerprint = null,
             )
         }
@@ -1221,13 +1230,34 @@ class AppViewModel @JvmOverloads constructor(
         }
     }
 
-    fun respondToApproval(decision: String, answers: Map<String, List<String>> = emptyMap()) {
-        val approval = _state.value.pendingApproval ?: return
+    fun respondToApproval(key: ApprovalQueueKey, decision: String, answers: Map<String, List<String>> = emptyMap()) {
+        val state = _state.value
+        val entry = state.approvalQueue.entries.firstOrNull { it.key == key } ?: return
+        if (decision == "disconnect") {
+            disconnect()
+            return
+        }
+        if (decision == "dismiss" && entry.delivery == ApprovalDelivery.UNCERTAIN) {
+            _state.update { it.copy(approvalQueue = it.approvalQueue.complete(key)) }
+            return
+        }
+        val approval = state.approvalQueue.requestForResponse(key) ?: return
+        if (!approval.canRespond(state.selectedThreadId, decision, answers)) return
         val client = rpc ?: return
+        _state.update { it.copy(approvalQueue = it.approvalQueue.markResponding(key)) }
         viewModelScope.launch {
             runCatching { client.respondToApproval(approval, decision, answers) }
-                .onSuccess { _state.update { it.copy(pendingApproval = null) } }
-                .onFailure(::showError)
+                .onSuccess {
+                    if (rpc === client) _state.update {
+                        it.copy(approvalQueue = it.approvalQueue.complete(key), notice = "Response sent; server delivery is not confirmed. No automatic replay.")
+                    }
+                }
+                .onFailure { error ->
+                    if (rpc === client) _state.update {
+                        it.copy(approvalQueue = it.approvalQueue.delivery(key, ApprovalDelivery.UNCERTAIN),
+                            notice = "Approval delivery uncertain: ${error.message}. This response will not be retried.")
+                    }
+                }
         }
     }
 
@@ -1372,12 +1402,32 @@ class AppViewModel @JvmOverloads constructor(
     }
     fun clearNotice() = _state.update { it.copy(notice = null) }
 
+    private fun retainApprovalFileItem(threadId: String?, item: TimelineItem) {
+        if (threadId.isNullOrBlank() || item.kind != TimelineKind.FILE_CHANGE || item.turnId.isNullOrBlank() ||
+            threadId.length > 4_096 || item.turnId.length > 4_096 || item.id.length > 4_096) return
+        val key = ApprovalFileItemKey(threadId, item.turnId, item.id)
+        _state.update { state ->
+            val cache = state.approvalFileItems.toMutableMap()
+            cache.remove(key)
+            item.fileApprovalSnapshotOrNull()?.let { snapshot ->
+                if (cache.size < 200 && cache.values.sumOf { it.approvalFileSnapshotRetainedCharCount } +
+                    snapshot.approvalFileSnapshotRetainedCharCount <= ApprovalQueue.MAX_RETAINED_CHARS) cache[key] = snapshot
+            }
+            state.copy(approvalFileItems = cache.toMap(),
+                approvalQueue = state.approvalQueue.bindFileChangeSnapshot(threadId, item))
+        }
+    }
+
     private fun observeEvents(client: CodexRpcClient) {
         eventJob?.cancel()
         eventJob = viewModelScope.launch {
             client.events.collect { event ->
+                if (rpc !== client) return@collect
                 when (event) {
-                    is AppServerEvent.ItemUpsert -> upsertItem(event.threadId, event.item)
+                    is AppServerEvent.ItemUpsert -> {
+                        retainApprovalFileItem(event.threadId, event.item)
+                        upsertItem(event.threadId, event.item)
+                    }
                     is AppServerEvent.AgentDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.AGENT)
                     is AppServerEvent.PlanDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.PLAN)
                     is AppServerEvent.ReasoningDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.REASONING)
@@ -1399,8 +1449,27 @@ class AppViewModel @JvmOverloads constructor(
                             refreshThreads()
                         }
                     }
-                    is AppServerEvent.Approval -> _state.update { state ->
-                        if (state.acceptsThreadEvent(event.threadId)) state.copy(pendingApproval = event.request) else state
+                    is AppServerEvent.Approval -> {
+                        val state = _state.value
+                        val request = event.request
+                        val item = if (request.threadId != null && request.turnId != null && request.itemId != null) {
+                            state.approvalFileItems[ApprovalFileItemKey(request.threadId, request.turnId, request.itemId)]
+                        } else null
+                        val result = state.approvalQueue.enqueueResult(request.bindFileChangesSnapshot(request.threadId, item))
+                        if (result.status == ApprovalEnqueueStatus.CAPACITY_EXCEEDED) {
+                            disconnectInternal(clearActive = false)
+                            showError(IllegalStateException("Approval queue exceeded its safe capacity. Disconnected without responding."))
+                        } else _state.update { it.copy(approvalQueue = result.queue) }
+                    }
+                    is AppServerEvent.ApprovalReviewUpdated -> _state.update {
+                        it.copy(approvalQueue = it.approvalQueue.updateReview(event.request))
+                    }
+                    is AppServerEvent.ApprovalResolved -> _state.update {
+                        it.copy(approvalQueue = it.approvalQueue.complete(event.threadId, event.requestId))
+                    }
+                    is AppServerEvent.FatalProtocolError -> {
+                        disconnectInternal(clearActive = false)
+                        showError(IllegalStateException(event.message))
                     }
                     AppServerEvent.AccountChanged -> refreshRemoteAccount()
                     AppServerEvent.ThreadsChanged -> refreshThreads()
