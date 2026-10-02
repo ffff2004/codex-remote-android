@@ -1632,13 +1632,14 @@ class AppViewModel @JvmOverloads constructor(
 
     private fun invalidateDraftFullAccess() {
         draftFullAccessGrant = null
-        _state.update { state ->
-            if (state.selectedThreadId == null && state.selectedPermissionProfile == ":danger-full-access")
-                state.copy(fullAccessConfirmation = null, selectedPermissionProfile = ":workspace",
-                    approvalPolicy = "on-request", approvalsReviewer = "user")
-            else state.copy(fullAccessConfirmation = null)
-        }
+        _state.update { it.withoutDraftFullAccess() }
     }
+
+    private fun AppUiState.withoutDraftFullAccess(): AppUiState =
+        if (selectedThreadId == null && selectedPermissionProfile == ":danger-full-access")
+            copy(fullAccessConfirmation = null, selectedPermissionProfile = ":workspace",
+                approvalPolicy = "on-request", approvalsReviewer = "user")
+        else copy(fullAccessConfirmation = null)
 
     /** Stage3 can close the transport and preserve exact cached selection for authoritative recovery. */
     fun closeForRecovery() {
@@ -1858,37 +1859,46 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     private fun publishThreadList(imported: List<RemoteThread>, complete: Boolean) {
-        _state.update { state ->
-            val byId = linkedMapOf<String, RemoteThread>()
-            if (!complete) state.threads.forEach { byId[it.id] = it }
-            else sessions.sessions.values.filter { it.protected || it.threadId == sessions.selectedThreadId }
-                .mapNotNull { it.thread }.forEach { byId[it.id] = it }
-            imported.forEach { byId[it.id] = it }
-            threadListEdits.forEach { (id, thread) ->
-                if (thread == null) byId.remove(id) else byId[id] = thread
-            }
-            val threads = byId.values.sortedWith(compareByDescending<RemoteThread> { it.updatedAt }.thenBy { it.id })
-            val projects = groupThreadsByProject(threads)
-            val selectedThreadId = state.selectedThreadId
-            state.copy(
-                threads = threads,
-                projects = projects,
-                selectedProjectPath = state.selectedProjectPath
-                    ?.takeIf { path -> selectedThreadId != null || projects.any { it.path == path } } ?: projects.firstOrNull()?.path,
-                selectedThreadId = selectedThreadId,
-                threadGoal = if (selectedThreadId == null) null else state.threadGoal,
-                isGoalLoading = if (selectedThreadId == null) false else state.isGoalLoading,
-                goalError = if (selectedThreadId == null) null else state.goalError,
-                threadTokenUsage = if (selectedThreadId == null) null else state.threadTokenUsage,
-                timeline = state.timeline,
-                olderHistoryCursor = if (selectedThreadId == null) null else state.olderHistoryCursor,
-                hasOlderHistory = selectedThreadId != null && state.hasOlderHistory,
-                isOlderHistoryLoading = selectedThreadId != null && state.isOlderHistoryLoading,
-                olderHistoryError = if (selectedThreadId == null) null else state.olderHistoryError,
-                consumedHistoryCursors = if (selectedThreadId == null) emptySet() else state.consumedHistoryCursors,
-                connectionMessage = connectionSummary(projects.size, threads.size, state.remoteServer?.codexVersion.orEmpty()),
-            )
+        val state = _state.value
+        val byId = linkedMapOf<String, RemoteThread>()
+        if (!complete) state.threads.forEach { byId[it.id] = it }
+        else sessions.sessions.values.filter { it.protected || it.threadId == sessions.selectedThreadId }
+            .mapNotNull { it.thread }.forEach { byId[it.id] = it }
+        imported.forEach { byId[it.id] = it }
+        threadListEdits.forEach { (id, thread) ->
+            if (thread == null) byId.remove(id) else byId[id] = thread
         }
+        val threads = byId.values.sortedWith(compareByDescending<RemoteThread> { it.updatedAt }.thenBy { it.id })
+        val projects = groupThreadsByProject(threads)
+        val selectedThreadId = state.selectedThreadId
+        val selectedProjectPath = state.selectedProjectPath
+            ?.takeIf { path -> selectedThreadId != null || projects.any { it.path == path } } ?: projects.firstOrNull()?.path
+        var published = state.copy(
+            threads = threads,
+            projects = projects,
+            selectedProjectPath = selectedProjectPath,
+            selectedThreadId = selectedThreadId,
+            threadGoal = if (selectedThreadId == null) null else state.threadGoal,
+            isGoalLoading = if (selectedThreadId == null) false else state.isGoalLoading,
+            goalError = if (selectedThreadId == null) null else state.goalError,
+            threadTokenUsage = if (selectedThreadId == null) null else state.threadTokenUsage,
+            timeline = state.timeline,
+            olderHistoryCursor = if (selectedThreadId == null) null else state.olderHistoryCursor,
+            hasOlderHistory = selectedThreadId != null && state.hasOlderHistory,
+            isOlderHistoryLoading = selectedThreadId != null && state.isOlderHistoryLoading,
+            olderHistoryError = if (selectedThreadId == null) null else state.olderHistoryError,
+            consumedHistoryCursors = if (selectedThreadId == null) emptySet() else state.consumedHistoryCursors,
+            connectionMessage = connectionSummary(projects.size, threads.size, state.remoteServer?.codexVersion.orEmpty()),
+        )
+        if (selectedThreadId == null && selectedProjectPath != state.selectedProjectPath) {
+            // Main-thread transition without suspension or effects inside a retryable StateFlow update.
+            // Preserve draft content/settings, but revoke authorization and stale selection callbacks.
+            draftFullAccessGrant = null
+            requests.advanceSelection()
+            selectionRevision++
+            published = published.withoutDraftFullAccess().copy(taskSelectionEpoch = selectionRevision)
+        }
+        _state.value = published
         registerPublishedThreads(_state.value.threads)
     }
 

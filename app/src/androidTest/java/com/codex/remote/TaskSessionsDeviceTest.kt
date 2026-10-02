@@ -23,6 +23,179 @@ import org.junit.runner.RunWith
 /** In-memory public AppServerSession injection; these are not SSH/daemon integration tests. */
 @RunWith(AndroidJUnit4::class)
 class TaskSessionsDeviceTest {
+    @Test fun refreshProjectRoundTripInvalidatesPendingDraftConfirmation() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            finishListing(vm, session)
+            onMain {
+                vm.newThread(); vm.setModel("second"); vm.setPermissionMode(PermissionMode.AUTO_REVIEW)
+                vm.updateComposer(null, TaskComposer("keep draft", 4)); vm.setPermissionMode(PermissionMode.FULL_ACCESS)
+            }
+            val old = vm.state.value.fullAccessConfirmation!!
+            val epoch = vm.state.value.taskSelectionEpoch
+            refreshListing(vm, session, listOf("b"))
+            assertNull(vm.state.value.fullAccessConfirmation)
+            assertTrue(vm.state.value.taskSelectionEpoch > epoch)
+            refreshListing(vm, session, listOf("a"))
+            onMain { vm.confirmFullAccess(old); vm.updateComposer(null, TaskComposer("stale callback"), epoch) }
+            assertEquals("keep draft", vm.state.value.composer.text)
+            assertEquals("second", vm.state.value.selectedModel)
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            assertEquals("auto_review", vm.state.value.approvalsReviewer)
+            sendDraftAndCheckSettings(vm, session, "pending-refresh-safe", ":workspace", "on-request", "auto_review")
+        }
+    }
+
+    @Test fun refreshProjectRoundTripInvalidatesGrantedDraftFullAccess() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            finishListing(vm, session)
+            onMain {
+                vm.newThread(); vm.setModel("second"); vm.updateComposer(null, TaskComposer("keep granted draft", 7))
+                vm.setPermissionMode(PermissionMode.FULL_ACCESS); vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!)
+            }
+            val epoch = vm.state.value.taskSelectionEpoch
+            refreshListing(vm, session, listOf("b"))
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            assertEquals("on-request", vm.state.value.approvalPolicy)
+            assertEquals("user", vm.state.value.approvalsReviewer)
+            assertTrue(vm.state.value.taskSelectionEpoch > epoch)
+            refreshListing(vm, session, listOf("a"))
+            assertEquals("keep granted draft", vm.state.value.composer.text)
+            sendDraftAndCheckSettings(vm, session, "granted-refresh-safe", ":workspace", "on-request")
+        }
+    }
+
+    @Test fun lateAuthorizedCreationCannotSelectRefreshChangedDraft() = runBlocking<Unit> {
+        lateAuthorizedCreationDuringRefresh(returnToA = false)
+    }
+
+    @Test fun lateAuthorizedCreationCannotSelectRefreshDraftReturningToOriginalProject() = runBlocking<Unit> {
+        lateAuthorizedCreationDuringRefresh(returnToA = true)
+    }
+
+    private suspend fun lateAuthorizedCreationDuringRefresh(returnToA: Boolean) {
+        withViewModel { vm, session ->
+            finishListing(vm, session)
+            onMain {
+                vm.newThread(); vm.setModel("second"); vm.setPermissionMode(PermissionMode.FULL_ACCESS)
+                vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!); vm.sendMessage("original creation")
+            }
+            val original = receive(session.starts)
+            val originalEpoch = vm.state.value.taskSelectionEpoch
+            refreshListing(vm, session, listOf("b"))
+            if (returnToA) refreshListing(vm, session, listOf("a"))
+            onMain { vm.updateComposer(null, TaskComposer("current draft", 5)); vm.setPermissionMode(PermissionMode.READ_ONLY) }
+            val epoch = vm.state.value.taskSelectionEpoch
+            val project = vm.state.value.selectedProjectPath
+            session.respond(original, created("refresh-late-original"))
+            val originalTurn = receive(session.turnWrites)
+            assertPermissions(original, ":danger-full-access", "never")
+            assertPermissions(originalTurn, ":danger-full-access", "never")
+            assertEquals("/fixture/a", originalTurn["params"]!!.jsonObject["cwd"]!!.jsonPrimitive.content)
+            assertEquals("refresh-late-original", originalTurn["params"]!!.jsonObject["threadId"]!!.jsonPrimitive.content)
+            assertNull(vm.state.value.selectedThreadId)
+            assertEquals(project, vm.state.value.selectedProjectPath)
+            assertEquals(epoch, vm.state.value.taskSelectionEpoch)
+            assertTrue(epoch > originalEpoch)
+            onMain { vm.updateComposer(null, TaskComposer("old composer callback"), originalEpoch) }
+            assertEquals("current draft", vm.state.value.composer.text)
+            assertEquals(":read-only", vm.state.value.selectedPermissionProfile)
+            finishTurn(vm, session, originalTurn, "refresh-late-original")
+            assertTrue(session.starts.tryReceive().isFailure)
+            assertTrue(session.turnWrites.tryReceive().isFailure)
+            sendDraftAndCheckSettings(vm, session, "refresh-current-safe", ":read-only", "on-request")
+            onMain { vm.selectThread(RemoteThread("refresh-late-original", "original", "/fixture/a", 1, "")) }
+            session.respond(receive(session.resumes), snapshot("refresh-late-original", "original resumed"))
+            await(vm) { !it.isGoalLoading }
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            assertEquals("never", vm.state.value.approvalPolicy)
+            assertEquals("second", vm.state.value.selectedModel)
+            onMain { vm.sendMessage("original next turn") }
+            val next = receive(session.turnWrites)
+            assertPermissions(next, ":danger-full-access", "never")
+            finishTurn(vm, session, next, "refresh-late-original")
+            assertEquals(4, session.startWrites)
+        }
+    }
+
+    @Test fun unchangedAndProgressiveListingPreserveDraftGrantIdentityAndComposerCallbacks() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            onMain {
+                vm.newThread(); vm.setModel("second"); vm.setPermissionMode(PermissionMode.FULL_ACCESS)
+                vm.confirmFullAccess(vm.state.value.fullAccessConfirmation!!)
+            }
+            val epoch = vm.state.value.taskSelectionEpoch
+            // The tail omits A; the first page still owns A in this progressive listing.
+            session.respond(receive(session.tails), listPage(listOf("b", "c"), null))
+            await(vm) { !it.isThreadsLoading }
+            assertEquals(epoch, vm.state.value.taskSelectionEpoch)
+            session.firstPageIds = listOf("b")
+            onMain { vm.retryThreads() }
+            val tail = receive(session.tails)
+            onMain { vm.updateComposer(null, TaskComposer("edit during partial page", 6), epoch) }
+            assertEquals("/fixture/a", vm.state.value.selectedProjectPath)
+            assertEquals(epoch, vm.state.value.taskSelectionEpoch)
+            assertEquals(":danger-full-access", vm.state.value.selectedPermissionProfile)
+            session.respond(tail, listPage(listOf("a"), null))
+            await(vm) { !it.isThreadsLoading }
+            onMain { vm.updateComposer(null, TaskComposer("edit after refresh", 8), epoch) }
+            assertEquals("edit after refresh", vm.state.value.composer.text)
+            assertEquals(epoch, vm.state.value.taskSelectionEpoch)
+            sendDraftAndCheckSettings(vm, session, "unchanged-granted", ":danger-full-access", "never")
+        }
+    }
+
+    @Test fun unchangedListingPreservesPendingDraftConfirmationAndSafeSettings() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            finishListing(vm, session)
+            onMain { vm.newThread(); vm.setModel("second"); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val confirmation = vm.state.value.fullAccessConfirmation!!
+            val epoch = vm.state.value.taskSelectionEpoch
+            refreshListing(vm, session, listOf("a"))
+            assertEquals(confirmation, vm.state.value.fullAccessConfirmation)
+            assertEquals(epoch, vm.state.value.taskSelectionEpoch)
+            onMain { vm.confirmFullAccess(confirmation) }
+            sendDraftAndCheckSettings(vm, session, "unchanged-pending", ":danger-full-access", "never")
+        }
+    }
+
+    private suspend fun finishListing(vm: AppViewModel, session: TaskSession) {
+        session.respond(receive(session.tails), listPage(session.firstPageIds, null))
+        await(vm) { !it.isThreadsLoading }
+    }
+
+    private suspend fun refreshListing(vm: AppViewModel, session: TaskSession, ids: List<String>) {
+        session.firstPageIds = ids
+        onMain { vm.retryThreads() }
+        finishListing(vm, session)
+        assertEquals(ids.map { "/fixture/$it" }.firstOrNull(), vm.state.value.selectedProjectPath)
+    }
+
+    private suspend fun sendDraftAndCheckSettings(vm: AppViewModel, session: TaskSession, id: String,
+        profile: String, policy: String, reviewer: String = "user") {
+        val project = vm.state.value.selectedProjectPath!!
+        onMain { vm.sendMessage("manual $id") }
+        val start = receive(session.starts)
+        assertPermissions(start, profile, policy, reviewer)
+        assertEquals(project, start["params"]!!.jsonObject["cwd"]!!.jsonPrimitive.content)
+        assertEquals("second", start["params"]!!.jsonObject["model"]!!.jsonPrimitive.content)
+        session.respond(start, obj("""{"thread":{"id":"$id","cwd":"$project"},"model":"model"}"""))
+        val turn = receive(session.turnWrites)
+        assertPermissions(turn, profile, policy, reviewer)
+        assertEquals(project, turn["params"]!!.jsonObject["cwd"]!!.jsonPrimitive.content)
+        assertEquals(id, turn["params"]!!.jsonObject["threadId"]!!.jsonPrimitive.content)
+        assertEquals("second", turn["params"]!!.jsonObject["model"]!!.jsonPrimitive.content)
+        finishTurn(vm, session, turn, id)
+        assertEquals(id, vm.state.value.selectedThreadId)
+        assertEquals(profile, vm.state.value.selectedPermissionProfile)
+        assertEquals(policy, vm.state.value.approvalPolicy)
+        assertEquals(reviewer, vm.state.value.approvalsReviewer)
+        assertEquals("second", vm.state.value.selectedModel)
+        onMain { vm.sendMessage("next $id") }
+        val next = receive(session.turnWrites)
+        assertPermissions(next, profile, policy, reviewer)
+        finishTurn(vm, session, next, id)
+    }
+
     @Test fun confirmedDraftUsesCapturedSettingsOnWireAndReturnedTaskAndNextDraftIsSafe() = runBlocking<Unit> {
         withViewModel { vm, session ->
             onMain { vm.newThread(); vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
@@ -810,7 +983,7 @@ class TaskSessionsDeviceTest {
         } finally { onMain { vm.disconnect(); holder.clear() }; store.delete(connection.id) }
     }
 
-    internal class TaskSession(private val firstPageIds: List<String> = listOf("a", "b")) : AppServerSession {
+    internal class TaskSession(var firstPageIds: List<String> = listOf("a", "b")) : AppServerSession {
         override val version = CodexRuntimeVersion("fixture", "fixture")
         private val incoming = Channel<JsonObject>(Channel.UNLIMITED)
         override val messages = incoming.receiveAsFlow()

@@ -92,6 +92,33 @@ class SessionRequestTrackerTest {
     }
 
     @Test
+    fun draftProjectRoundTripCannotReviveSelectionOrCancelOriginalTaskOperations() {
+        val tracker = SessionRequestTracker()
+        tracker.invalidateConnection()
+        val originalDraft = tracker.captureDraftSelection()
+        val resume = tracker.beginSessionLoad("protected-task")
+        val history = tracker.beginSessionLoad("protected-task", SessionLoadPurpose.HISTORY)
+        val turn = tracker.beginTurnStart("original-created-task")
+
+        assertTrue(tracker.reconcileSelection(null, "/a", null, "/b"))
+        val intermediateDraft = tracker.captureDraftSelection()
+        assertTrue(tracker.reconcileSelection(null, "/b", null, "/a"))
+        val currentDraft = tracker.captureDraftSelection()
+        assertFalse(tracker.isCurrent(originalDraft))
+        assertFalse(tracker.isCurrent(intermediateDraft))
+        assertTrue(tracker.isCurrent(currentDraft))
+        assertFalse(tracker.reconcileSelection(null, "/a", null, "/a"))
+        assertTrue(tracker.isCurrent(currentDraft))
+
+        assertTrue(tracker.isCurrent(resume))
+        assertTrue(tracker.isCurrent(history))
+        assertEquals(TurnStartResponseDisposition.APPLY, tracker.resolveTurnStartResponse(turn, "original-turn"))
+        tracker.observeTurnCompleted("original-created-task", "original-turn")
+        assertEquals(TurnStartResponseDisposition.TERMINAL, tracker.resolveTurnStartResponse(turn, "original-turn"))
+        assertFalse(tracker.canRollbackTurnStart(turn))
+    }
+
+    @Test
     fun completedNotificationBeforeResponseCannotReopenTheTurn() {
         val tracker = SessionRequestTracker()
         tracker.invalidateConnection()
