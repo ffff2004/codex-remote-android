@@ -1,9 +1,12 @@
 package com.codex.remote.session
 
+internal enum class SessionLoadPurpose { RESUME, HISTORY }
+
 internal data class SessionLoadToken(
     val threadId: String,
     val connectionGeneration: Long,
     val requestSequence: Long,
+    val purpose: SessionLoadPurpose,
 )
 
 internal data class DraftSelectionToken(
@@ -51,7 +54,7 @@ internal class SessionRequestTracker(
     private var requestSequence: Long = 0
     private var selectionRevision: Long = 0
     private var turnStartSequence: Long = 0
-    private val latestRequestByThread = mutableMapOf<String, Long>()
+    private val latestRequestByThread = mutableMapOf<Pair<String, SessionLoadPurpose>, Long>()
     private val latestTurnStartByThread = mutableMapOf<String, TurnStartOperation>()
     private val recentCompletedTurns = linkedMapOf<CompletedTurnKey, Long>()
 
@@ -66,7 +69,7 @@ internal class SessionRequestTracker(
 
     /** Eviction invalidates old read/write callback owners instead of retaining unbounded maps. */
     fun retainTasks(threadIds: Set<String>) {
-        latestRequestByThread.keys.retainAll(threadIds)
+        latestRequestByThread.keys.removeAll { it.first !in threadIds }
         latestTurnStartByThread.keys.retainAll(threadIds)
     }
 
@@ -97,16 +100,21 @@ internal class SessionRequestTracker(
         return true
     }
 
-    fun beginSessionLoad(threadId: String): SessionLoadToken {
+    fun beginSessionLoad(threadId: String, purpose: SessionLoadPurpose = SessionLoadPurpose.RESUME): SessionLoadToken {
         require(threadId.isNotBlank())
         val sequence = ++requestSequence
-        latestRequestByThread[threadId] = sequence
-        return SessionLoadToken(threadId, connectionGeneration, sequence)
+        if (purpose == SessionLoadPurpose.RESUME) invalidateHistoryLoad(threadId)
+        latestRequestByThread[threadId to purpose] = sequence
+        return SessionLoadToken(threadId, connectionGeneration, sequence, purpose)
     }
 
     fun isCurrent(token: SessionLoadToken): Boolean =
         token.connectionGeneration == connectionGeneration &&
-            latestRequestByThread[token.threadId] == token.requestSequence
+            latestRequestByThread[token.threadId to token.purpose] == token.requestSequence
+
+    fun invalidateHistoryLoad(threadId: String) {
+        latestRequestByThread.remove(threadId to SessionLoadPurpose.HISTORY)
+    }
 
     fun isCurrentConnection(generation: Long): Boolean = generation == connectionGeneration
 

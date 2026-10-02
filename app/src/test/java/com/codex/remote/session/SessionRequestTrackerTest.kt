@@ -7,6 +7,23 @@ import org.junit.Test
 
 class SessionRequestTrackerTest {
     @Test
+    fun paginationCannotSupersedeResumeAndANewerResumeInvalidatesItsOldPages() {
+        val tracker = SessionRequestTracker()
+        val resume = tracker.beginSessionLoad("a")
+        val page = tracker.beginSessionLoad("a", SessionLoadPurpose.HISTORY)
+        assertTrue(tracker.isCurrent(resume))
+        assertTrue(tracker.isCurrent(page))
+        val nextPage = tracker.beginSessionLoad("a", SessionLoadPurpose.HISTORY)
+        assertTrue(tracker.isCurrent(resume))
+        assertFalse(tracker.isCurrent(page))
+        assertTrue(tracker.isCurrent(nextPage))
+        val replacement = tracker.beginSessionLoad("a")
+        assertFalse(tracker.isCurrent(resume))
+        assertFalse(tracker.isCurrent(nextPage))
+        assertTrue(tracker.isCurrent(replacement))
+    }
+
+    @Test
     fun laterLoadForTheSameThreadSupersedesAnOlderResponse() {
         val tracker = SessionRequestTracker()
         tracker.invalidateConnection()

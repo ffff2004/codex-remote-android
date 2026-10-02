@@ -81,7 +81,8 @@ internal class ResumeEventCoordinator<Event>(
      * Immediately invalidates the outstanding resume owner while retaining its queued events.
      * The returned epoch owns a snapshot-free drain; a late response for the old epoch is stale.
      */
-    fun abandonResume(): ResumeEventEpoch? = synchronized(stateLock) {
+    fun abandonResume(expectedEpoch: ResumeEventEpoch? = null): ResumeEventEpoch? = synchronized(stateLock) {
+        if (expectedEpoch != null && expectedEpoch.value != activeEpoch) return@synchronized null
         if (mode == Mode.LIVE) return@synchronized null
         epochSequence += 1L
         activeEpoch = epochSequence

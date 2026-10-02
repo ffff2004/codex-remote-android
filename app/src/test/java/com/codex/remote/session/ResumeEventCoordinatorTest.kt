@@ -15,6 +15,21 @@ import org.junit.Test
 
 class ResumeEventCoordinatorTest {
     @Test
+    fun finishingAnOldResumeCannotAbandonOrDrainItsSuccessor() = runTest {
+        val coordinator = ResumeEventCoordinator<String>(4)
+        val applied = mutableListOf<String>()
+        val old = coordinator.beginResume()
+        coordinator.processOrBuffer("old queued") { applied += it }
+        val next = coordinator.beginResume()
+        assertEquals(null, coordinator.abandonResume(old))
+        coordinator.processOrBuffer("new queued") { applied += it }
+        assertTrue(applied.isEmpty())
+        coordinator.drainAfterResume(next, { applied += "snapshot" }) { applied += it }
+        assertEquals(listOf("snapshot", "old queued", "new queued"), applied)
+        assertEquals(null, coordinator.abandonResume(next))
+    }
+
+    @Test
     fun moreThanSharedFlowCapacityCannotBlockTheResumeResponse() = runTest {
         val coordinator = ResumeEventCoordinator<Int>(maxBufferedEvents = 512)
         val epoch = coordinator.beginResume()

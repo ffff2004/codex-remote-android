@@ -356,6 +356,87 @@ class TaskSessionsDeviceTest {
         }
     }
 
+    @Test fun paginationBeforeResumeDrainsBackgroundEventsAndPreservesHistoryProgress() = runBlocking<Unit> {
+        paginationDuringResume(historyFirst = true)
+    }
+
+    @Test fun resumeBeforePaginationDrainsBackgroundEventsAndMergesHistory() = runBlocking<Unit> {
+        paginationDuringResume(historyFirst = false)
+    }
+
+    @Test fun changedResumeCursorRejectsLatePageAndClearsItsLoadingState() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            open(vm, session, "a"); open(vm, session, "b")
+            select(vm, "a"); val resume = receive(session.resumes)
+            onMain { vm.loadOlderHistory() }; val page = receive(session.history)
+            val result = snapshot("a", "new snapshot window")
+            session.respond(resume, JsonObject(result + ("initialTurnsPage" to
+                JsonObject(result["initialTurnsPage"]!!.jsonObject + ("nextCursor" to JsonPrimitive("fresh-window"))))))
+            await(vm) { it.olderHistoryCursor == "fresh-window" && !it.isGoalLoading }
+            session.respond(page, obj("""{"data":[{"id":"stale-page-turn","status":"completed","items":[{"type":"agentMessage","id":"stale-page","text":"stale page"}]}],"nextCursor":"stale-next"}"""))
+            session.delta("a", "live", "barrier", "processed after page")
+            await(vm) { it.timeline.any { i -> i.id == "barrier" } }
+            assertEquals("fresh-window", vm.state.value.olderHistoryCursor)
+            assertFalse(vm.state.value.isOlderHistoryLoading)
+            assertFalse(vm.state.value.timeline.any { it.id == "stale-page" })
+        }
+    }
+
+    @Test fun cancelledRecoveryResumeDrainsItsEventsAndLateResponseCannotTouchSuccessor() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            open(vm, session, "b", activeTurn = "live-b"); open(vm, session, "a")
+            coroutineScope {
+                val recovery = async { vm.resumeCachedTaskForRecovery("a") }
+                val old = receive(session.resumes)
+                session.turn("b", "live-b", false)
+                session.emit(obj("""{"id":"cancelled-resume-approval","method":"item/commandExecution/requestApproval","params":{"threadId":"b","turnId":"live-b","itemId":"cmd","command":"pwd","cwd":"/fixture/b"}}"""))
+                session.delta("a", "live-a", "cancelled-buffer", "must drain")
+                recovery.cancel(); recovery.join()
+                await(vm) { it.timeline.any { i -> i.id == "cancelled-buffer" } && it.approvalQueue.entries.size == 1 }
+                assertFalse(vm.state.value.taskIndicators["b"]!!.running)
+                select(vm, "b"); val next = receive(session.resumes)
+                session.delta("b", "new-b", "successor-buffer", "after successor")
+                session.respond(old, snapshot("a", "cancelled snapshot"))
+                session.respond(next, snapshot("b", "successor snapshot", "new-b"))
+                await(vm) { it.timeline.any { i -> i.id == "successor-buffer" } && !it.isGoalLoading }
+                assertEquals("b", vm.state.value.selectedThreadId)
+                assertFalse(vm.state.value.timeline.any { it.body == "cancelled snapshot" })
+            }
+        }
+    }
+
+    private suspend fun paginationDuringResume(historyFirst: Boolean) {
+        withViewModel { vm, session ->
+            open(vm, session, "a")
+            open(vm, session, "b", activeTurn = "live-b")
+            select(vm, "a"); val resume = receive(session.resumes)
+            onMain { vm.loadOlderHistory() }; val history = receive(session.history)
+            session.turn("b", "live-b", false)
+            session.emit(obj("""{"id":"approval-b","method":"item/commandExecution/requestApproval","params":{"threadId":"b","turnId":"live-b","itemId":"cmd-b","command":"pwd","cwd":"/fixture/b"}}"""))
+            session.emit(obj("""{"id":"approval-a","method":"item/commandExecution/requestApproval","params":{"threadId":"a","turnId":"live-a","itemId":"cmd-a","command":"pwd","cwd":"/fixture/a"}}"""))
+            session.delta("a", "live-a", "during-resume", "live during resume")
+            val page = obj("""{"data":[{"id":"old-turn","status":"completed","items":[{"type":"agentMessage","id":"older-item","text":"older history"}]}],"nextCursor":"older-next"}""")
+            if (historyFirst) {
+                session.respond(history, page)
+                await(vm) { it.timeline.any { i -> i.id == "older-item" } }
+                session.respond(resume, snapshot("a", "fresh resume", "live-a"))
+            } else {
+                session.respond(resume, snapshot("a", "fresh resume", "live-a"))
+                await(vm) { it.timeline.any { i -> i.body == "fresh resume" } && !it.isGoalLoading }
+                session.respond(history, page)
+            }
+            await(vm) { it.timeline.any { i -> i.body == "fresh resume" } && it.timeline.any { i -> i.id == "older-item" } &&
+                it.timeline.any { i -> i.id == "during-resume" } && it.approvalQueue.entries.size == 2 && !it.isOlderHistoryLoading }
+            assertEquals(listOf("b", "a"), vm.state.value.approvalQueue.entries.map { it.request.threadId })
+            assertFalse(vm.state.value.taskIndicators["b"]!!.running)
+            assertEquals("older-next", vm.state.value.olderHistoryCursor)
+            assertTrue("older-a" in vm.state.value.consumedHistoryCursors)
+            session.delta("a", "live-a", "after-drain", "live after drain")
+            await(vm) { it.timeline.any { i -> i.id == "after-drain" } }
+            assertEquals(0, session.startWrites)
+        }
+    }
+
     private suspend fun open(vm: AppViewModel, session: TaskSession, id: String, remoteGrant: Boolean = false, activeTurn: String? = null) {
         select(vm, id)
         val request = receive(session.resumes)
@@ -392,6 +473,7 @@ class TaskSessionsDeviceTest {
         override val messages = incoming.receiveAsFlow()
         override val diagnostics = Channel<String>(Channel.UNLIMITED).receiveAsFlow()
         val resumes = Channel<JsonObject>(Channel.UNLIMITED)
+        val history = Channel<JsonObject>(Channel.UNLIMITED)
         val starts = Channel<JsonObject>(Channel.UNLIMITED)
         val tails = Channel<JsonObject>(Channel.UNLIMITED)
         val turnWrites = Channel<JsonObject>(Channel.UNLIMITED)
@@ -405,6 +487,7 @@ class TaskSessionsDeviceTest {
                 "thread/list" -> if (message["params"]!!.jsonObject["cursor"] == null) respond(message, listPage(firstPageIds, "tail")) else tails.send(message)
                 "model/list" -> respond(message, obj("""{"data":[{"id":"model","model":"model","isDefault":true},{"id":"second","model":"second"}]}"""))
                 "thread/resume" -> resumes.send(message)
+                "thread/turns/list" -> history.send(message)
                 "thread/start" -> starts.send(message)
                 "turn/start" -> { startWrites++; turnWrites.send(message) }
                 "turn/steer" -> turnWrites.send(message)

@@ -11,6 +11,8 @@ import com.codex.remote.data.runtime.AppServerRuntime
 import com.codex.remote.data.runtime.SshCodexAppServerRuntime
 import com.codex.remote.data.runtime.UnknownHostKeyException
 import com.codex.remote.data.store.ConnectionStore
+import com.codex.remote.session.ResumeEventEpoch
+import com.codex.remote.session.SessionLoadPurpose
 import com.codex.remote.session.ResumeEventCoordinator
 import com.codex.remote.session.ResumeEventOfferDisposition
 import com.codex.remote.session.ResumeEventDrainDisposition
@@ -76,6 +78,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.UUID
@@ -572,20 +575,21 @@ class AppViewModel @JvmOverloads constructor(
         val revision = selectionRevision
         requests.retainTasks(sessions.sessions.keys)
         val streamRevision = sessions.sessions.getValue(thread.id).liveRevision
+        val historyCursor = sessions.sessions.getValue(thread.id).olderHistoryCursor
         val loadToken = requests.beginSessionLoad(thread.id)
         viewModelScope.launch {
             val epoch = resumeEvents.beginResume()
             if (rpc !== client || revision != selectionRevision) {
-                abandonResume()
+                finishResume(client, epoch)
                 return@launch
             }
-            updateTask(thread.id) { it.copy(isGoalLoading = true) }
+            updateTask(thread.id) { it.copy(isGoalLoading = true, isOlderHistoryLoading = false) }
             pendingOperations++
             try {
                 val snapshot = client.resumeThread(thread.id, thread.cwd)
                 if (rpc !== client || revision != selectionRevision || !requests.isCurrent(loadToken)) return@launch
                 val disposition = resumeEvents.drainAfterResume(epoch, applySnapshot = {
-                    installResumeSnapshot(thread.id, snapshot, streamRevision)
+                    installResumeSnapshot(thread.id, snapshot, streamRevision, historyCursor)
                 }, applyEvent = { applyServerEvent(client, it) })
                 if (disposition == ResumeEventDrainDisposition.OVERFLOW) failSessionCapacity("Resume event buffer exceeded capacity")
                 if (rpc !== client || revision != selectionRevision || !requests.isCurrent(loadToken)) return@launch
@@ -599,11 +603,13 @@ class AppViewModel @JvmOverloads constructor(
                 }
             } catch (error: Throwable) {
                 if (rpc === client && revision == selectionRevision && requests.isCurrent(loadToken)) {
-                    abandonResume()
                     updateTask(thread.id) { it.copy(isGoalLoading = false) }
                     showError(error)
                 }
-            } finally { if (rpc === client) pendingOperations = (pendingOperations - 1).coerceAtLeast(0) }
+            } finally {
+                finishResume(client, epoch)
+                if (rpc === client) pendingOperations = (pendingOperations - 1).coerceAtLeast(0)
+            }
         }
     }
 
@@ -620,7 +626,7 @@ class AppViewModel @JvmOverloads constructor(
             return
         }
         updateTask(threadId) { it.copy(isOlderHistoryLoading = true, olderHistoryError = null) }
-        val revision = requests.beginSessionLoad(threadId)
+        val revision = requests.beginSessionLoad(threadId, SessionLoadPurpose.HISTORY)
         viewModelScope.launch {
             pendingOperations++
             val consumed = task.consumedHistoryCursors + cursor
@@ -1371,7 +1377,9 @@ class AppViewModel @JvmOverloads constructor(
     }
     fun clearNotice() = _state.update { it.copy(notice = null) }
 
-    private fun installResumeSnapshot(threadId: String, snapshot: RemoteThreadSession, streamRevision: Long) {
+    private fun installResumeSnapshot(threadId: String, snapshot: RemoteThreadSession, streamRevision: Long, historyCursor: String?) {
+        val preserveHistory = historyCursor != null && snapshot.olderHistoryCursor == historyCursor
+        if (!preserveHistory) requests.invalidateHistoryLoad(threadId)
         updateTask(threadId) { task ->
             val remote = RemoteThreadSettingsSnapshot(snapshot.model, snapshot.reasoningEffort,
                 snapshot.serviceTier, snapshot.collaborationMode, snapshot.permissionProfile,
@@ -1379,8 +1387,11 @@ class AppViewModel @JvmOverloads constructor(
             val snapshotTurn = snapshot.activeTurnId?.takeUnless { requests.isCompleted(threadId, it) }
             val preserveLive = task.liveRevision != streamRevision || task.pendingWrites > 0
             task.copy(timeline = reconcileSessionTimeline(task.timeline, snapshot.timeline),
-                olderHistoryCursor = snapshot.olderHistoryCursor, hasOlderHistory = snapshot.olderHistoryCursor != null,
-                isOlderHistoryLoading = false, olderHistoryError = null, consumedHistoryCursors = emptySet(),
+                olderHistoryCursor = if (preserveHistory) task.olderHistoryCursor else snapshot.olderHistoryCursor,
+                hasOlderHistory = if (preserveHistory) task.hasOlderHistory else snapshot.olderHistoryCursor != null,
+                isOlderHistoryLoading = preserveHistory && task.isOlderHistoryLoading,
+                olderHistoryError = if (preserveHistory) task.olderHistoryError else null,
+                consumedHistoryCursors = if (preserveHistory) task.consumedHistoryCursors else emptySet(),
                 settings = task.settings.mergeRemote(remote),
                 activeTurnId = if (preserveLive) task.activeTurnId else snapshotTurn,
                 isTurnRunning = if (preserveLive) task.isTurnRunning else
@@ -1396,12 +1407,13 @@ class AppViewModel @JvmOverloads constructor(
         val connection = requests.connectionGeneration
         val token = requests.beginSessionLoad(threadId)
         val epoch = resumeEvents.beginResume()
+        updateTask(threadId) { it.copy(isOlderHistoryLoading = false) }
         pendingOperations++
         try {
             val snapshot = client.resumeThread(threadId, task.thread?.cwd.orEmpty())
             if (rpc !== client || !requests.isCurrent(token)) return@withContext false
             val disposition = resumeEvents.drainAfterResume(epoch,
-                applySnapshot = { installResumeSnapshot(threadId, snapshot, task.liveRevision) },
+                applySnapshot = { installResumeSnapshot(threadId, snapshot, task.liveRevision, task.olderHistoryCursor) },
                 applyEvent = { applyServerEvent(client, it) })
             if (disposition == ResumeEventDrainDisposition.OVERFLOW) failSessionCapacity("Resume event buffer exceeded capacity")
             if (disposition != ResumeEventDrainDisposition.DRAINED || rpc !== client ||
@@ -1414,10 +1426,13 @@ class AppViewModel @JvmOverloads constructor(
             }
             rpc === client && requests.isCurrent(token)
         } catch (error: Throwable) {
-            if (rpc === client && requests.isCurrent(token)) { abandonResume(); showError(error) }
+            if (rpc === client && requests.isCurrent(token)) showError(error)
             if (error is CancellationException) throw error
             false
-        } finally { if (rpc === client) pendingOperations = (pendingOperations - 1).coerceAtLeast(0) }
+        } finally {
+            finishResume(client, epoch)
+            if (rpc === client) pendingOperations = (pendingOperations - 1).coerceAtLeast(0)
+        }
     }
 
     private fun SavedConnection.exactSessionHostKey(): String = listOf(id, username, host, port.toString(), hostKeyFingerprint).joinToString("\u0000")
@@ -1514,6 +1529,14 @@ class AppViewModel @JvmOverloads constructor(
             if (!acceptMutation(sessions.update(id) { it.copy(hasApproval = id in owners) })) return
         }
         publishSelectedSession()
+    }
+
+    /** Only this resume may abandon its buffer; a late callback cannot drain a successor. */
+    private suspend fun finishResume(client: CodexRpcClient, epoch: ResumeEventEpoch) = withContext(NonCancellable) {
+        if (rpc !== client) return@withContext
+        val abandoned = resumeEvents.abandonResume(epoch) ?: return@withContext
+        val disposition = resumeEvents.drainAbandonedResume(abandoned) { applyServerEvent(client, it) }
+        if (disposition == ResumeEventDrainDisposition.OVERFLOW) failSessionCapacity("Resume event buffer exceeded capacity")
     }
 
     private fun abandonResume() {
