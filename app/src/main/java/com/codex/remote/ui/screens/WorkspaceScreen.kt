@@ -124,6 +124,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -154,12 +155,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.ApprovalDelivery
+import com.codex.remote.domain.canRespond
 import com.codex.remote.domain.ConnectionStatus
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.ComposerMentionKind
 import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerTriggerKind
 import com.codex.remote.domain.FileChangeSummary
+import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.FullAccessTarget
+import com.codex.remote.domain.TaskComposer
+import com.codex.remote.domain.TaskIndicator
 import com.codex.remote.domain.PermissionMode
 import com.codex.remote.domain.RemoteProject
 import com.codex.remote.domain.RemoteDeviceLogin
@@ -227,15 +235,30 @@ fun WorkspaceScreen(
     onSetCollaborationMode: (String) -> Unit,
     onSetPermissionProfile: (String?) -> Unit,
     onSetPermissionMode: (PermissionMode) -> Unit,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
     onLoadRemoteDirectory: (String) -> Unit,
     onClearRemoteDirectory: () -> Unit,
     onStartLogin: () -> Unit,
     onCancelLogin: () -> Unit,
-    onApproval: (String, Map<String, List<String>>) -> Unit,
+    onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit,
     onTrustHostKey: () -> Unit,
     onRejectHostKey: () -> Unit,
     onDismissNotice: () -> Unit,
+    onConfirmFullAccess: (FullAccessConfirmation) -> Unit = {},
+    onCancelFullAccess: () -> Unit = {},
 ) {
+    state.fullAccessConfirmation?.let { confirmation ->
+        val scopeText = when (val target = confirmation.target) {
+            is FullAccessTarget.ExistingThread -> "仅对任务 ${target.threadId} 启用完全访问。"
+            is FullAccessTarget.Draft -> "仅对当前 New Task 草稿（项目 ${target.projectPath}）启用完全访问，用于创建任务和首个 turn。"
+        }
+        AlertDialog(onDismissRequest = onCancelFullAccess,
+            title = { Text("确认完全访问") },
+            text = { Text(scopeText + "Codex 将无需逐项审批即可读写文件和执行命令。" +
+                if (state.isTurnRunning) " 当前 turn 保持原权限；下个 turn 生效。" else "") },
+            confirmButton = { TextButton(onClick = { onConfirmFullAccess(confirmation) }) { Text("确认完全访问") } },
+            dismissButton = { TextButton(onClick = onCancelFullAccess) { Text("取消") } })
+    }
     val drawerState = androidx.compose.material3.rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
@@ -301,6 +324,7 @@ fun WorkspaceScreen(
                     onSetCollaborationMode = onSetCollaborationMode,
                     onSetPermissionProfile = onSetPermissionProfile,
                     onSetPermissionMode = onSetPermissionMode,
+                    onUpdateComposer = onUpdateComposer,
                     onLoadRemoteDirectory = onLoadRemoteDirectory,
                     onClearRemoteDirectory = onClearRemoteDirectory,
                     onStartLogin = onStartLogin,
@@ -377,6 +401,7 @@ fun WorkspaceScreen(
                     onSetCollaborationMode = onSetCollaborationMode,
                     onSetPermissionProfile = onSetPermissionProfile,
                     onSetPermissionMode = onSetPermissionMode,
+                    onUpdateComposer = onUpdateComposer,
                     onLoadRemoteDirectory = onLoadRemoteDirectory,
                     onClearRemoteDirectory = onClearRemoteDirectory,
                     onStartLogin = onStartLogin,
@@ -388,10 +413,17 @@ fun WorkspaceScreen(
         }
     }
 
-    state.pendingApproval?.let { approval ->
+    state.approvalQueue.currentEntry?.let { entry ->
+        val approval = entry.request
         ApprovalDialog(
             approval = approval,
-            onDecision = onApproval,
+            selectedThreadId = state.selectedThreadId,
+            ownerTitle = state.threads.firstOrNull { it.id == approval.threadId }?.title,
+            delivery = entry.delivery,
+            queueCount = state.approvalQueue.entries.size,
+            onSelectOwner = state.threads.firstOrNull { it.id == approval.threadId }?.let { owner -> { onSelectThread(owner) } },
+            onDisconnect = { onApproval(entry.key, "disconnect", emptyMap()) },
+            onDecision = { decision, answers -> onApproval(entry.key, decision, answers) },
         )
     }
     state.pendingHostKeyFingerprint?.let { fingerprint ->
@@ -548,6 +580,7 @@ private fun WorkspaceSidebar(
                     val expanded = searchQuery.isNotBlank() || expandedProjects[project.id] == true
                     Row(
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
+                            .testTag("sidebar-project-${project.id}")
                             .clickable { expandedProjects[project.id] = !expanded }
                             .padding(horizontal = 10.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -601,6 +634,7 @@ private fun WorkspaceSidebar(
                     items(project.threads, key = { "thread-${it.id}" }) { thread ->
                         ThreadSidebarRow(
                             thread = thread,
+                                indicator = state.taskIndicators[thread.id] ?: TaskIndicator(),
                             selected = thread.id == state.selectedThreadId,
                             onSelect = { onSelectThread(thread) },
                             onRename = { onRenameThread(thread) },
@@ -649,6 +683,7 @@ private fun WorkspaceSidebar(
 @Composable
 private fun ThreadSidebarRow(
     thread: RemoteThread,
+    indicator: TaskIndicator = TaskIndicator(),
     selected: Boolean,
     onSelect: () -> Unit,
     onRename: () -> Unit,
@@ -656,6 +691,12 @@ private fun ThreadSidebarRow(
     onSetPinned: (Boolean) -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    val markers = buildList {
+        if (indicator.running || thread.status.contains("active", true)) add("Running")
+        if (indicator.approval) add("Approval")
+        if (indicator.failed) add("Failed")
+        if (indicator.unread > 0) add("Unread ${indicator.unread}")
+    }
     Row(
         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
             .background(if (selected) MaterialTheme.colorScheme.surface else Color.Transparent)
@@ -678,6 +719,8 @@ private fun ThreadSidebarRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
             )
+            if (markers.isNotEmpty()) Text(markers.joinToString(" · "), style = MaterialTheme.typography.labelSmall,
+                color = if (indicator.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary)
         }
         if (thread.isPinned) {
             Icon(
@@ -687,9 +730,6 @@ private fun ThreadSidebarRow(
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.width(4.dp))
-        }
-        if (thread.status.contains("active", true)) {
-            Box(Modifier.size(6.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondary))
         }
         Box {
             IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(34.dp)) {
@@ -815,6 +855,7 @@ private fun WorkspaceContent(
     onSetCollaborationMode: (String) -> Unit,
     onSetPermissionProfile: (String?) -> Unit,
     onSetPermissionMode: (PermissionMode) -> Unit,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
     onLoadRemoteDirectory: (String) -> Unit,
     onClearRemoteDirectory: () -> Unit,
     onStartLogin: () -> Unit,
@@ -971,6 +1012,7 @@ private fun WorkspaceContent(
                             onSetCollaborationMode = onSetCollaborationMode,
                             onSetPermissionProfile = onSetPermissionProfile,
                             onSetPermissionMode = onSetPermissionMode,
+                    onUpdateComposer = onUpdateComposer,
                             onLoadRemoteDirectory = onLoadRemoteDirectory,
                             onClearRemoteDirectory = onClearRemoteDirectory,
                             modifier = Modifier.fillMaxWidth(),
@@ -1494,6 +1536,11 @@ private fun TimelineRow(item: TimelineItem, modifier: Modifier) {
             ) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 11.dp)) {
                     SelectionContainer { Text(item.body, style = MaterialTheme.typography.bodyLarge) }
+                    if (item.id.startsWith("local-") && item.status in setOf("awaiting confirmation", "delivery uncertain")) {
+                        Spacer(Modifier.height(5.dp))
+                        Text(if (item.status == "delivery uncertain") "发送结果不确定；不会自动重发" else "等待远端消息确认",
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     if (item.isGoal) {
                         Spacer(Modifier.height(7.dp))
                         Row(
@@ -1923,25 +1970,34 @@ private fun Composer(
     onLoadRemoteDirectory: (String) -> Unit,
     onClearRemoteDirectory: () -> Unit,
     modifier: Modifier = Modifier,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
 ) {
-    var text by remember(state.selectedThreadId) { mutableStateOf(TextFieldValue()) }
-    var selectedMentions by remember(state.selectedThreadId) { mutableStateOf(emptyList<ComposerMention>()) }
-    var attachments by remember(state.selectedThreadId) { mutableStateOf(emptyList<ComposerImageAttachment>()) }
+    var text by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(TextFieldValue(state.composer.text, TextRange(state.composer.cursor.coerceIn(0, state.composer.text.length)))) }
+    var selectedMentions by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(state.composer.mentions) }
+    var attachments by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(state.composer.attachments) }
     var attachmentError by remember(state.selectedThreadId) { mutableStateOf<String?>(null) }
     var mentionKindFilter by remember(state.selectedThreadId) { mutableStateOf<ComposerMentionKind?>(null) }
     var modelSettingsMenu by remember(state.selectedThreadId) { mutableStateOf(false) }
     var modelSettingsPage by remember(state.selectedThreadId) { mutableStateOf(ModelSettingsPage.ROOT) }
     var addMenuOpen by remember(state.selectedThreadId) { mutableStateOf(false) }
     var showRemotePathPicker by remember(state.selectedThreadId) { mutableStateOf(false) }
-    var goalModeActive by remember(state.selectedThreadId) { mutableStateOf(false) }
+    var goalModeActive by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(state.composer.goalMode) }
+    val composerOwner = state.selectedThreadId
+    val composerEpoch = state.taskSelectionEpoch
+    val currentComposerEpoch by rememberUpdatedState(composerEpoch)
+    LaunchedEffect(state.activeConnection?.id, composerOwner, text, selectedMentions, attachments, goalModeActive) {
+        onUpdateComposer(composerOwner, composerEpoch, TaskComposer(text.text, text.selection.end, selectedMentions, attachments, goalModeActive))
+    }
     var policyMenu by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val composerScope = rememberCoroutineScope()
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri ?: return@rememberLauncherForActivityResult
+        val imageEpoch = composerEpoch
         composerScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { readComposerImageAttachment(context, uri) } }
             result.onSuccess { attachment ->
+                if (imageEpoch != currentComposerEpoch) return@onSuccess
                 attachments = (attachments + attachment).takeLast(MAX_COMPOSER_IMAGES)
                 attachmentError = null
             }.onFailure { error ->
@@ -3295,6 +3351,7 @@ private fun PermissionDropdown(
     properties: PopupProperties,
     onDismiss: () -> Unit,
     onSetPermissionMode: (PermissionMode) -> Unit,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
     onSetPermissionProfile: (String) -> Unit,
 ) {
     val selectedMode = permissionModeFor(
@@ -3923,77 +3980,74 @@ private fun ConnectionState(
 @Composable
 private fun ApprovalDialog(
     approval: com.codex.remote.domain.ApprovalRequest,
+    selectedThreadId: String?,
+    ownerTitle: String?,
+    delivery: ApprovalDelivery,
+    queueCount: Int,
+    onSelectOwner: (() -> Unit)?,
+    onDisconnect: () -> Unit,
     onDecision: (String, Map<String, List<String>>) -> Unit,
 ) {
-    val answers = remember(approval.requestId) {
-        mutableStateMapOf<String, String>().apply {
-            approval.questions.forEach { question ->
-                this[question.id] = question.options.firstOrNull().orEmpty()
-            }
-        }
-    }
+    val answers = remember(approval.requestId) { mutableStateMapOf<String, String>() }
+    val answerMap = answers.mapValues { listOf(it.value) }
+    val pending = delivery == ApprovalDelivery.PENDING
     AlertDialog(
         onDismissRequest = {},
-        icon = {
-            Icon(
-                if (approval.kind == ApprovalKind.FILE_CHANGE) Icons.Outlined.Code else Icons.Outlined.Terminal,
-                contentDescription = null,
-            )
-        },
         title = { Text(approval.title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(approval.detail, style = MaterialTheme.typography.bodyMedium)
-                if (approval.kind == ApprovalKind.USER_INPUT) {
-                    approval.questions.forEach { question ->
-                        if (question.header.isNotBlank()) {
-                            Text(question.header, style = MaterialTheme.typography.labelLarge)
+            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Owner: ${ownerTitle ?: approval.threadId ?: "Unknown task"}")
+                approval.threadId?.let { Text("Thread: $it", style = MonoText) }
+                Text("$queueCount pending request(s)")
+                if (approval.threadId == null || selectedThreadId != approval.threadId) {
+                    Text("Select the exact owner task to Allow. Deny remains available.")
+                    onSelectOwner?.let { select -> TextButton(onClick = select) { Text("Select owner task") } }
+                }
+                if (delivery == ApprovalDelivery.SENDING) Text("Sending response…")
+                if (delivery == ApprovalDelivery.UNCERTAIN) Text("Delivery uncertain. This response cannot be retried. Check the remote task before taking further action.")
+                Text(approval.detail)
+                approval.context.forEach { field ->
+                    Text(field.label, style = MaterialTheme.typography.labelLarge)
+                    SelectionContainer { Text(field.value, style = MonoText) }
+                }
+                approval.fileChanges.forEach { change ->
+                    Text("${change.kind}: ${change.path}${change.movePath?.let { " → $it" }.orEmpty()}")
+                    SelectionContainer { Text(change.diff, style = MonoText) }
+                }
+                if (!approval.canApprove(emptyList())) Text("Details are incomplete or exceed the review budget. Allow is disabled.")
+                approval.questions.forEach { question ->
+                    Text(question.header, style = MaterialTheme.typography.labelLarge)
+                    Text(question.question)
+                    question.options.forEach { option ->
+                        TextButton(onClick = { answers[question.id] = option.label }, enabled = pending) {
+                            Column { Text((if (answers[question.id] == option.label) "✓ " else "") + option.label); Text(option.description) }
                         }
-                        Text(question.question, style = MaterialTheme.typography.bodyMedium)
-                        question.options.forEach { option ->
-                            val selected = answers[question.id] == option
-                            Row(
-                                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
-                                    .selectable(selected = selected, onClick = { answers[question.id] = option })
-                                    .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
-                                    .padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                if (selected) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(17.dp))
-                                else Spacer(Modifier.width(17.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(option)
-                            }
-                        }
-                        OutlinedTextField(
-                            value = answers[question.id].orEmpty(),
-                            onValueChange = { answers[question.id] = it },
-                            label = { Text("Response") },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
                     }
-                } else {
-                    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(5.dp)) {
-                        SelectionContainer {
-                            Text(approval.detail, Modifier.fillMaxWidth().padding(10.dp), style = MonoText)
-                        }
+                    if (question.options.isEmpty() || question.isOther) {
+                        OutlinedTextField(value = answers[question.id].orEmpty(), onValueChange = { answers[question.id] = it },
+                            label = { Text(if (question.isOther) "Other / response" else "Response") }, enabled = pending)
                     }
                 }
             }
         },
         confirmButton = {
-            Button(onClick = {
-                onDecision("accept", answers.mapValues { listOf(it.value) })
-            }, enabled = approval.kind != ApprovalKind.USER_INPUT || answers.values.all { it.isNotBlank() }) {
-                Text(if (approval.kind == ApprovalKind.USER_INPUT) "Send" else "Allow once")
+            Column {
+                approval.availableDecisions.filter { it.startsWith("accept") }.forEach { decision ->
+                    Button(onClick = { onDecision(decision, answerMap) }, enabled = pending && approval.canRespond(selectedThreadId, decision, answerMap)) {
+                        Text(if (approval.kind == ApprovalKind.USER_INPUT) "Send" else if (decision == "acceptForSession") "Allow session" else "Allow once")
+                    }
+                }
             }
         },
         dismissButton = {
             Row {
-                TextButton(onClick = { onDecision("decline", emptyMap()) }) { Text("Deny") }
-                if (approval.kind == ApprovalKind.COMMAND || approval.kind == ApprovalKind.FILE_CHANGE) {
-                    TextButton(onClick = { onDecision("acceptForSession", emptyMap()) }) { Text("Allow session") }
+                approval.availableDecisions.filter { it == "decline" || it == "cancel" }.forEach { decision ->
+                    TextButton(onClick = { onDecision(decision, emptyMap()) }, enabled = pending) { Text(if (decision == "cancel") "Cancel task" else "Deny") }
                 }
+                if (approval.availableDecisions.none { it == "decline" || it == "cancel" }) {
+                    TextButton(onClick = onDisconnect, enabled = pending) { Text("Disconnect") }
+                }
+                if (delivery == ApprovalDelivery.UNCERTAIN) TextButton(onClick = { onDecision("dismiss", emptyMap()) }) { Text("Acknowledge") }
             }
         },
     )

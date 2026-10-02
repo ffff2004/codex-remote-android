@@ -236,6 +236,8 @@ data class RemoteDeviceLogin(
 )
 
 data class RemoteThreadSession(
+    val activeTurnId: String? = null,
+    val isTurnRunning: Boolean = false,
     val timeline: List<TimelineItem>,
     val model: String?,
     val reasoningEffort: String?,
@@ -344,38 +346,47 @@ data class TimelineItem(
     val expanded: Boolean = false,
     val fileChanges: List<FileChangeSummary> = emptyList(),
     val isGoal: Boolean = false,
+    val turnId: String? = null,
+    val fileChangesComplete: Boolean = false,
+    val clientId: String? = null,
 )
 
 data class FileChangeSummary(
     val path: String,
     val kind: String,
     val diff: String,
-)
-
-enum class ApprovalKind { COMMAND, FILE_CHANGE, PERMISSION, USER_INPUT, UNKNOWN }
-
-enum class PermissionMode { ASK, AUTO_REVIEW, FULL_ACCESS, READ_ONLY }
-
-data class ApprovalQuestion(
-    val id: String,
-    val header: String,
-    val question: String,
-    val options: List<String> = emptyList(),
-)
-
-data class ApprovalRequest(
-    val requestId: String,
-    val kind: ApprovalKind,
-    val title: String,
-    val detail: String,
-    val rawMethod: String,
-    val rawParams: String = "{}",
-    val questions: List<ApprovalQuestion> = emptyList(),
+    val movePath: String? = null,
 )
 
 enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
 
+data class TaskRecoveryTarget(val threadId: String, val cwd: String, val running: Boolean,
+    val activeGoal: Boolean, val approval: Boolean, val pendingWrite: Boolean)
+
+data class TaskIndicator(val running: Boolean = false, val approval: Boolean = false, val failed: Boolean = false, val unread: Int = 0)
+
+sealed interface FullAccessTarget {
+    data class ExistingThread(val threadId: String) : FullAccessTarget
+    data class Draft(val selectionRevision: Long, val projectPath: String) : FullAccessTarget
+}
+
+data class FullAccessConfirmation(
+    val connectionGeneration: Long,
+    val hostKey: String,
+    val target: FullAccessTarget,
+) {
+    fun matches(generation: Long, host: String?, currentTarget: FullAccessTarget?): Boolean =
+        connectionGeneration == generation && hostKey == host && target == currentTarget
+}
+
+data class TaskComposer(val text: String = "", val cursor: Int = 0, val mentions: List<ComposerMention> = emptyList(), val attachments: List<ComposerImageAttachment> = emptyList(), val goalMode: Boolean = false)
+
 data class AppUiState(
+    val taskSelectionEpoch: Long = 0,
+    val taskIndicators: Map<String, TaskIndicator> = emptyMap(),
+    val composer: TaskComposer = TaskComposer(),
+    val fullAccessConfirmation: FullAccessConfirmation? = null,
+    val recoveryBlocked: Boolean = false,
     val savedConnections: List<SavedConnection> = emptyList(),
     val activeConnection: SavedConnection? = null,
     val connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED,
@@ -433,8 +444,11 @@ data class AppUiState(
     val approvalPolicy: String = "on-request",
     val isTurnRunning: Boolean = false,
     val activeTurnId: String? = null,
-    val pendingApproval: ApprovalRequest? = null,
+    val approvalQueue: ApprovalQueue = ApprovalQueue(),
+    val approvalFileItems: Map<ApprovalFileItemKey, TimelineItem> = emptyMap(),
     val pendingHostKeyFingerprint: String? = null,
+    val maintenanceStatus: String? = null,
+    val recoveryApprovalWarning: String? = null,
     val isRestoringLastConnection: Boolean = true,
     val showConnections: Boolean = false,
     val showConnectionEditor: Boolean = false,
@@ -479,14 +493,14 @@ internal fun mergeTimelineHistory(
     older: List<TimelineItem>,
     newer: List<TimelineItem>,
 ): List<TimelineItem> {
-    val newerById = newer.associateBy(TimelineItem::id)
-    val seen = mutableSetOf<String>()
+    val newerById = newer.associateBy { it.turnId to it.id }
+    val seen = mutableSetOf<Pair<String?, String>>()
     return buildList(older.size + newer.size) {
         older.forEach { item ->
-            if (seen.add(item.id)) add(newerById[item.id] ?: item)
+            if (seen.add(item.turnId to item.id)) add(newerById[item.turnId to item.id] ?: item)
         }
         newer.forEach { item ->
-            if (seen.add(item.id)) add(item)
+            if (seen.add(item.turnId to item.id)) add(item)
         }
     }
 }

@@ -13,6 +13,8 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -30,11 +32,20 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.codex.remote.data.rpc.CodexRpcClient
 import com.codex.remote.data.store.ConnectionStore
+import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalRequest
+import com.codex.remote.domain.ApprovalQueue
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.RpcRequestId
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.AuthType
 import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.FileChangeSummary
+import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.FullAccessTarget
+import com.codex.remote.domain.TaskComposer
+import com.codex.remote.domain.TaskIndicator
 import com.codex.remote.domain.PermissionMode
 import com.codex.remote.domain.ReasoningEffortOption
 import com.codex.remote.domain.RemoteAccount
@@ -71,6 +82,51 @@ import kotlin.math.abs
 
 @RunWith(AndroidJUnit4::class)
 class WorkspaceDeviceTest {
+    @Test
+    fun backgroundApprovalShowsExactOwnerAndOnlyAllowsDeny() {
+        val request = approvalFor("thread-background")
+        val state = mutableStateOf(baseState().copy(approvalQueue = ApprovalQueue().enqueue(request)))
+        val callbacks = WorkspaceCallbacks()
+        var denied: ApprovalQueueKey? = null
+        callbacks.onApproval = { key, decision, _ -> if (decision == "decline") denied = key }
+        show(state, callbacks)
+        composeRule.onNodeWithText("Thread: thread-background").assertIsDisplayed()
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("Deny").assertIsEnabled().performClick()
+        assertEquals(state.value.approvalQueue.currentEntry!!.key, denied)
+    }
+
+    @Test
+    fun approvalACompletionKeepsBVisibleWithItsOwnCallbackIdentity() {
+        val owner = baseState().selectedThreadId!!
+        val queue = ApprovalQueue().enqueue(approvalFor(owner)).enqueue(approvalFor(owner).copy(requestId = RpcRequestId.Text("B"), title = "Second approval"))
+        val state = mutableStateOf(baseState().copy(approvalQueue = queue))
+        val callbacks = WorkspaceCallbacks()
+        callbacks.onApproval = { key, _, _ -> state.value = state.value.copy(approvalQueue = state.value.approvalQueue.complete(key)) }
+        show(state, callbacks)
+        composeRule.onNodeWithText("Allow once").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Second approval").assertIsDisplayed()
+        composeRule.runOnIdle { state.value = state.value.copy(approvalQueue = state.value.approvalQueue.complete(queue.currentEntry!!.key)) }
+        composeRule.onNodeWithText("Second approval").assertIsDisplayed()
+    }
+
+    @Test
+    fun missingFileReviewCannotBeAuthorizedDespiteConversationChanges() {
+        val owner = baseState().selectedThreadId!!
+        val request = approvalFor(owner).copy(kind = ApprovalKind.FILE_CHANGE, title = "Review missing patch", rawMethod = "item/fileChange/requestApproval")
+        val state = mutableStateOf(baseState().copy(approvalQueue = ApprovalQueue().enqueue(request),
+            timeline = listOf(TimelineItem("some-other-item", TimelineKind.FILE_CHANGE, fileChanges = listOf(FileChangeSummary("a.kt", "update", "+safe"))))))
+        show(state)
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("Deny").assertIsEnabled()
+    }
+
+    private fun approvalFor(owner: String) = ApprovalRequest(
+        requestId = RpcRequestId.Text("A"), kind = ApprovalKind.COMMAND, title = "First approval", detail = "git status",
+        rawMethod = "item/commandExecution/requestApproval", threadId = owner, turnId = "turn-a", itemId = "command-a",
+        availableDecisions = listOf("accept", "decline"),
+    )
+
     @Test
     fun partialHistoryShowsLoadingAndRetryWithoutHidingWorkspace() {
         val state = mutableStateOf(baseState().copy(isThreadsLoading = true))
@@ -147,6 +203,8 @@ class WorkspaceDeviceTest {
         val state = mutableStateOf(baseState(timeline = runningTimeline, isTurnRunning = true))
         show(state)
 
+        // A user scroll leaves follow-latest mode before the programmatic item search.
+        composeRule.onNodeWithTag(CONVERSATION_LIST).performTouchInput { swipeDown() }
         scrollTo("timeline-tool-body-reasoning")
         composeRule.onNodeWithText("private reasoning").assertIsDisplayed()
         scrollTo("timeline-tool-body-command-group:cmd-1")
@@ -458,6 +516,66 @@ val answer = 42
         composeRule.onAllNodesWithText("{\"changes\"", substring = true).assertCountEquals(0)
     }
 
+    @Test fun fullAccessDialogExplainsScopeAndPassesCapturedConfirmation() {
+        val confirmation = FullAccessConfirmation(7, "tester@host:22", FullAccessTarget.ExistingThread("thread-a"))
+        val state = mutableStateOf(baseState(isTurnRunning = true).copy(fullAccessConfirmation = confirmation))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+        composeRule.onNodeWithText("仅对任务 thread-a", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("下个 turn", substring = true).assertIsDisplayed()
+        composeRule.onAllNodesWithText("确认完全访问")[1].performClick()
+        composeRule.runOnIdle { assertEquals(confirmation, callbacks.confirmation) }
+    }
+
+    @Test fun draftFullAccessDialogShowsProjectFirstTurnAndCapturedIdentity() {
+        val confirmation = FullAccessConfirmation(7, "tester@host:22", FullAccessTarget.Draft(11, "/fixture/project"))
+        val state = mutableStateOf(baseState().copy(selectedThreadId = null, fullAccessConfirmation = confirmation))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+        composeRule.onNodeWithText("当前 New Task 草稿（项目 /fixture/project）", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("用于创建任务和首个 turn", substring = true).assertIsDisplayed()
+        composeRule.onAllNodesWithText("确认完全访问")[1].performClick()
+        composeRule.runOnIdle { assertEquals(confirmation, callbacks.confirmation) }
+    }
+
+    @Test fun cachedTaskDraftRestoresAndComposerCallbackCarriesExactSelectionEpoch() {
+        val state = mutableStateOf(baseState().copy(taskSelectionEpoch = 7, composer = TaskComposer("draft A", 7)))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+        assertEquals("draft A", composerText())
+        composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput(" edited")
+        composeRule.runOnIdle {
+            assertEquals("thread-a", callbacks.composerOwner)
+            assertEquals(7L, callbacks.composerEpoch)
+            assertEquals("draft A edited", callbacks.composer!!.text)
+            state.value = state.value.copy(selectedThreadId = "thread-b", taskSelectionEpoch = 8,
+                composer = TaskComposer("draft B", 7))
+        }
+        assertEquals("draft B", composerText())
+    }
+
+    @Test fun sidebarShowsRunningApprovalFailedAndUnreadIndicators() {
+        val state = mutableStateOf(baseState().copy(taskIndicators = mapOf("thread-a" to TaskIndicator(true, true, true, 2))))
+        show(state)
+        if (composeRule.onAllNodesWithText("Running · Approval · Failed · Unread 2").fetchSemanticsNodes().isEmpty() &&
+            composeRule.onAllNodesWithText("demo").fetchSemanticsNodes().isEmpty()) {
+            composeRule.onNodeWithContentDescription("打开会话").performClick()
+        }
+        if (composeRule.onAllNodesWithText("Running · Approval · Failed · Unread 2").fetchSemanticsNodes().isEmpty()) {
+            composeRule.onNodeWithTag("sidebar-project-/workspace/demo").performClick()
+        }
+        composeRule.onNodeWithText("Running · Approval · Failed · Unread 2").assertIsDisplayed()
+    }
+
+    @Test fun unconfirmedPhoneMessageRemainsDistinctFromSameDesktopText() {
+        show(mutableStateOf(baseState(timeline = listOf(
+            TimelineItem("local-phone", TimelineKind.USER, body = "same text", clientId = "local-phone", status = "awaiting confirmation"),
+            TimelineItem("desktop-message", TimelineKind.USER, body = "same text", clientId = "desktop-client", turnId = "t"),
+        ))))
+        composeRule.onAllNodesWithText("same text").assertCountEquals(2)
+        composeRule.onNodeWithText("等待远端消息确认").assertIsDisplayed()
+    }
+
     private fun scrollTo(tag: String) {
         composeRule.onNodeWithTag(CONVERSATION_LIST).performScrollToNode(hasTestTag(tag))
         composeRule.onNodeWithTag(tag).assertIsDisplayed()
@@ -507,11 +625,13 @@ val answer = 42
                     onSetCollaborationMode = { callbacks.collaborationMode = it },
                     onSetPermissionProfile = {},
                     onSetPermissionMode = { callbacks.permissionMode = it },
+                    onUpdateComposer = { owner, epoch, composer -> callbacks.composerOwner = owner; callbacks.composerEpoch = epoch; callbacks.composer = composer },
+                    onConfirmFullAccess = { callbacks.confirmation = it },
                     onLoadRemoteDirectory = {},
                     onClearRemoteDirectory = {},
                     onStartLogin = {},
                     onCancelLogin = {},
-                    onApproval = { _, _ -> },
+                    onApproval = callbacks.onApproval,
                     onTrustHostKey = {},
                     onRejectHostKey = {},
                     onDismissNotice = {},
@@ -591,6 +711,11 @@ class RemoteStateDeviceTest {
 }
 
 private class WorkspaceCallbacks {
+    var confirmation: FullAccessConfirmation? = null
+    var composerOwner: String? = null
+    var composerEpoch: Long? = null
+    var composer: TaskComposer? = null
+    var onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit = { _, _, _ -> }
     var onRetryThreads: () -> Unit = {}
     var collaborationMode: String? = null
     var permissionMode: PermissionMode? = null

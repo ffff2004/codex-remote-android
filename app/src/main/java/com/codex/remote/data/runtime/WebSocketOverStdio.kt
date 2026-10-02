@@ -98,6 +98,10 @@ internal class WebSocketOverStdio(
 
     /** Sends one masked text frame. Throws after [close]. */
     suspend fun sendText(text: String) = withContext(Dispatchers.IO) {
+        sendTextBlocking(text)
+    }
+
+    internal fun sendTextBlocking(text: String) {
         if (closed) throw AppServerException.AppServerConnectionLost("WebSocket 已关闭")
         synchronized(writeLock) {
             if (closed) throw AppServerException.AppServerConnectionLost("WebSocket 已关闭")
@@ -156,16 +160,10 @@ internal class WebSocketOverStdio(
     }
 
     override fun close() {
-        synchronized(writeLock) {
-            if (closed) return
-            if (!closeFrameSent) {
-                closeFrameSent = true
-                runCatching { writeFrameLocked(OPCODE_CLOSE, CLOSE_NORMAL, fin = true) }
-            }
-            closed = true
-        }
-        runCatching { output.close() }
+        // Abort must never wait for writeLock: its owner may be blocked writing to this stream.
+        closed = true
         runCatching { input.close() }
+        runCatching { output.close() }
     }
 
     private fun readUpgradeResponse(): UpgradeResponse {

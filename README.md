@@ -46,6 +46,27 @@ Opening a conversation resumes its live app-server subscription while loading
 only the latest five full turns; older turns are fetched as the chat is scrolled
 to the top, with a legacy full-history fallback for older Codex hosts.
 
+Connect enables foreground connection maintenance by default. The connection
+belongs to the app process, so Activity rotation or removal keeps SSH open.
+The notification and the in-app maintenance bar both offer Disconnect; deleting
+the active host also stops maintenance. Notification permission denial does not
+prevent connection maintenance: use the in-app Disconnect control if Android
+hides the notification.
+
+Automatic recovery pauses without a default network or during Doze, and stops
+after ten failed dials with capped exponential backoff. Running tasks and pending
+approvals defer proactive network handoff; genuine transport loss restores the
+connection and cached task subscriptions. It never retries messages, commands,
+reviews, forks, or approval responses. Approval delivery uncertainty requires
+manual checking on the server. Authentication, host-key, installation, protocol,
+and capacity failures require manual Connect after correcting the cause.
+
+Only the desired saved connection ID is persisted for system service recreation.
+Drafts and full-access grants remain in memory and are scoped to the exact saved
+host, username, port, pinned fingerprint and task. A new process restores safe
+permissions. Android may delay or prevent recreation after killing the process;
+force-stop requires opening the app and connecting again.
+
 The model and reasoning pickers are also remote data. They are loaded from
 `model/list`, so the choices follow the Codex version and account configured on
 that SSH host rather than a hard-coded Android catalog.
@@ -69,11 +90,15 @@ endorsed by OpenAI. Codex and OpenAI are trademarks of their respective owner.
 Open this directory in Android Studio, or run `./gradlew assembleDebug` with
 JDK 17 and Android SDK 35 installed.
 
-Run the device-side regression suite on a connected emulator or Android device:
+Run the injected UI/session/owner regression suite on a connected emulator or Android device:
 
 ```text
-./gradlew connectedDebugAndroidTest
+./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.codex.remote.ConnectionHistoryDeviceTest,com.codex.remote.TaskSessionsDeviceTest,com.codex.remote.WorkspaceDeviceTest,com.codex.remote.ConnectionRecoveryDeviceTest
 ```
+
+The full connected suite also includes `SshRecoveryDeviceTest`, which requires
+configured loopback SSH fixtures. See the device validation recipe in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#device-validation).
 
 The first SSH handshake asks you to verify its SHA-256 host-key fingerprint
 before any password or private key is sent. Subsequent key changes are blocked

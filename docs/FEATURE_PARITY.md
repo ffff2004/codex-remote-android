@@ -20,7 +20,9 @@ Audit baseline:
 | Long conversations | Open at the latest message, load older turns incrementally while scrolling upward, preserve the visible anchor during prepend, and show a return-to-latest button away from the bottom. |
 | MCP | Show server/tool/resource status, start OAuth, observe completion, and reload remote MCP configuration. |
 | Authentication | Reuse remote auth and support the ChatGPT device-code flow. |
-| Approvals | Command, file-change, permission, and structured user-input requests. |
+| Approvals | FIFO command/file-change/permission/user-input queue; exact owner, frozen complete review, typed RPC identity, deny-only unknown context, explicit uncertain-delivery handling. |
+| Task supervision | Independent cached timelines, drafts/settings/goals/grants; background event routing, running/approval/failed/unread indicators, ordered resume, client-ID message matching. |
+| Connection maintenance | One process owner, foreground service and Disconnect; finite network/Doze recovery, read-only resubscription, visible exhausted/fatal state and no write replay. |
 | Diagnostics | Context and rate-limit status, app-server warnings, feedback upload, and SSH host-key pinning. |
 
 ## Remaining gaps
@@ -50,7 +52,7 @@ Audit baseline:
 
 - Windows remote hosts are unsupported. The app requires a POSIX host with a Codex install created by `install.sh`, reached through `codex app-server daemon start` and `codex app-server proxy --sock` over SSH.
 - The remote app-server is a shared, persistent daemon. Android never stops, restarts or bootstraps it, and remote turns keep running while the phone is disconnected.
-- No external `--remote-socket` mode for a user-managed control socket, and no automatic reconnect or resubscribe after connection loss.
+- No external `--remote-socket` mode for a user-managed control socket. Recovery is bounded and best effort; force-stop/system-kill restart and physical cellular/Wi-Fi/VPN handoff are not guaranteed. Waydroid API33 validation does not cover vendor power policy or API34/35+ foreground-service enforcement.
 - OpenSSH config expansion, ProxyJump, SSH agent or hardware-key authentication, and managed relay pairing.
 - Remote file open-in-editor actions, deep links, desktop notifications, and Android share-sheet integration.
 

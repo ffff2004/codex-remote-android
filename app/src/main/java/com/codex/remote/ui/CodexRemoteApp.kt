@@ -3,6 +3,14 @@ package com.codex.remote.ui
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
@@ -17,66 +25,80 @@ fun CodexRemoteApp(viewModel: AppViewModel) {
     val state by viewModel.state.collectAsState()
     val showConnections = state.showConnections || state.activeConnection == null
 
-    if (state.isRestoringLastConnection) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator()
+    Column(Modifier.fillMaxSize()) {
+        state.maintenanceStatus?.let { status ->
+            Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(status, Modifier.weight(1f))
+                TextButton(onClick = viewModel::disconnect) { Text("Disconnect") }
+            }
         }
-    } else if (showConnections) {
-        ConnectionsScreen(
-            state = state,
-            onBack = { viewModel.showConnections(false) },
-            onAdd = { viewModel.editConnection() },
-            onEdit = viewModel::editConnection,
-            onDelete = viewModel::deleteConnection,
-            onConnect = viewModel::connect,
-            onSave = viewModel::saveConnection,
-            onCloseEditor = viewModel::closeEditor,
-            onDismissNotice = viewModel::clearNotice,
-        )
-    } else {
-        WorkspaceScreen(
-            state = state,
-            onOpenConnections = { viewModel.showConnections(true) },
-            onNewThread = viewModel::newThread,
-            onSelectProject = viewModel::selectProject,
-            onSelectThread = viewModel::selectThread,
-            onLoadOlderHistory = viewModel::loadOlderHistory,
-            onRetryThreads = viewModel::retryThreads,
-            onRenameThread = viewModel::renameThread,
-            onArchiveThread = viewModel::archiveThread,
-            onLoadArchivedThreads = viewModel::loadArchivedThreads,
-            onUnarchiveThread = viewModel::unarchiveThread,
-            onDeleteArchivedThread = viewModel::deleteArchivedThread,
-            onSetThreadPinned = viewModel::setThreadPinned,
-            onSend = viewModel::sendMessage,
-            onStop = viewModel::interruptTurn,
-            onCompactThread = viewModel::compactThread,
-            onForkThread = viewModel::forkThread,
-            onStartReview = viewModel::startReview,
-            onRunInit = viewModel::runInit,
-            onLoadMcpStatus = viewModel::loadMcpStatus,
-            onReloadMcpServers = viewModel::reloadMcpServers,
-            onStartMcpLogin = viewModel::startMcpLogin,
-            onMcpAuthorizationHandled = viewModel::clearMcpAuthorizationUrl,
-            onSubmitFeedback = viewModel::submitFeedback,
-            onSetGoal = viewModel::setThreadGoal,
-            onSetGoalStatus = viewModel::setThreadGoalStatus,
-            onClearGoal = viewModel::clearThreadGoal,
-            onShowStatus = viewModel::showConnectionStatus,
-            onSetModel = viewModel::setModel,
-            onSetReasoningEffort = viewModel::setReasoningEffort,
-            onSetServiceTier = viewModel::setServiceTier,
-            onSetCollaborationMode = viewModel::setCollaborationMode,
-            onSetPermissionProfile = viewModel::setPermissionProfile,
-            onSetPermissionMode = viewModel::setPermissionMode,
-            onLoadRemoteDirectory = viewModel::loadRemoteDirectory,
-            onClearRemoteDirectory = viewModel::clearRemoteDirectory,
-            onStartLogin = viewModel::startRemoteLogin,
-            onCancelLogin = viewModel::cancelRemoteLogin,
-            onApproval = viewModel::respondToApproval,
-            onTrustHostKey = viewModel::trustPendingHostKey,
-            onRejectHostKey = viewModel::rejectPendingHostKey,
-            onDismissNotice = viewModel::clearNotice,
-        )
+        state.recoveryApprovalWarning?.let { Text(it, Modifier.padding(12.dp)) }
+        Box(Modifier.weight(1f)) {
+            if (state.isRestoringLastConnection) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else if (showConnections) {
+                ConnectionsScreen(
+                    state = state,
+                    onBack = { viewModel.showConnections(false) },
+                    onAdd = { viewModel.editConnection() },
+                    onEdit = viewModel::editConnection,
+                    onDelete = viewModel::deleteConnection,
+                    onConnect = viewModel::connect,
+                    onSave = viewModel::saveConnection,
+                    onCloseEditor = viewModel::closeEditor,
+                    onDismissNotice = viewModel::clearNotice,
+                )
+            } else {
+                WorkspaceScreen(
+                    state = state,
+                    onOpenConnections = { viewModel.showConnections(true) },
+                    onNewThread = viewModel::newThread,
+                    onSelectProject = viewModel::selectProject,
+                    onSelectThread = viewModel::selectThread,
+                    onLoadOlderHistory = viewModel::loadOlderHistory,
+                    onRetryThreads = viewModel::retryThreads,
+                    onRenameThread = viewModel::renameThread,
+                    onArchiveThread = viewModel::archiveThread,
+                    onLoadArchivedThreads = viewModel::loadArchivedThreads,
+                    onUnarchiveThread = viewModel::unarchiveThread,
+                    onDeleteArchivedThread = viewModel::deleteArchivedThread,
+                    onSetThreadPinned = viewModel::setThreadPinned,
+                    onSend = viewModel::sendMessage,
+                    onStop = viewModel::interruptTurn,
+                    onCompactThread = viewModel::compactThread,
+                    onForkThread = viewModel::forkThread,
+                    onStartReview = viewModel::startReview,
+                    onRunInit = viewModel::runInit,
+                    onLoadMcpStatus = viewModel::loadMcpStatus,
+                    onReloadMcpServers = viewModel::reloadMcpServers,
+                    onStartMcpLogin = viewModel::startMcpLogin,
+                    onMcpAuthorizationHandled = viewModel::clearMcpAuthorizationUrl,
+                    onSubmitFeedback = viewModel::submitFeedback,
+                    onSetGoal = viewModel::setThreadGoal,
+                    onSetGoalStatus = viewModel::setThreadGoalStatus,
+                    onClearGoal = viewModel::clearThreadGoal,
+                    onShowStatus = viewModel::showConnectionStatus,
+                    onSetModel = viewModel::setModel,
+                    onSetReasoningEffort = viewModel::setReasoningEffort,
+                    onSetServiceTier = viewModel::setServiceTier,
+                    onSetCollaborationMode = viewModel::setCollaborationMode,
+                    onSetPermissionProfile = viewModel::setPermissionProfile,
+                    onSetPermissionMode = viewModel::setPermissionMode,
+                    onUpdateComposer = { owner, epoch, composer -> viewModel.updateComposer(owner, composer, epoch) },
+                    onConfirmFullAccess = viewModel::confirmFullAccess,
+                    onCancelFullAccess = viewModel::cancelFullAccess,
+                    onLoadRemoteDirectory = viewModel::loadRemoteDirectory,
+                    onClearRemoteDirectory = viewModel::clearRemoteDirectory,
+                    onStartLogin = viewModel::startRemoteLogin,
+                    onCancelLogin = viewModel::cancelRemoteLogin,
+                    onApproval = viewModel::respondToApproval,
+                    onTrustHostKey = viewModel::trustPendingHostKey,
+                    onRejectHostKey = viewModel::rejectPendingHostKey,
+                    onDismissNotice = viewModel::clearNotice,
+                )
+            }
+        }
     }
 }
