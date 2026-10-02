@@ -1434,6 +1434,8 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     private fun failSessionCapacity(message: String) {
+        // Block maintenance synchronously before publishing the intermediate disconnected state.
+        maintenance?.recoveryBlocked()
         ++connectionGeneration
         connectionJob?.cancel()
         disconnectInternal(clearActive = false, preserveTaskState = true)

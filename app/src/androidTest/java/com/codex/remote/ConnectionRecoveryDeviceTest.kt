@@ -131,6 +131,22 @@ class ConnectionRecoveryDeviceTest {
         }
     }
 
+    @Test fun malformedRpcIdentityBlocksPlatformRecoveryUntilManualConnect() = runBlocking<Unit> {
+        val first = TaskSession(); val recovered = TaskSession(); val calls = AtomicInteger()
+        withOwner(AppServerRuntime { _, _ -> if (calls.getAndIncrement() == 0) first else recovered }) { owner, saved, _ ->
+            val vm = owner.viewModel
+            onMain { vm.connect(saved) }; await(vm) { it.connectionStatus == ConnectionStatus.CONNECTED }
+            first.emit(obj("""{"id":{},"method":"item/commandExecution/requestApproval","params":{}}"""))
+            await(vm) { it.recoveryBlocked && it.connectionStatus == ConnectionStatus.ERROR }
+            onMain { repeat(10) { owner.networkAvailable(it.toLong()); owner.deviceIdle(true); owner.deviceIdle(false) } }
+            delay(300)
+            assertEquals(1, calls.get()); assertTrue(vm.state.value.recoveryBlocked)
+            onMain { vm.connect(saved) }
+            await(vm) { it.connectionStatus == ConnectionStatus.CONNECTED && calls.get() == 2 }
+            assertFalse(vm.state.value.recoveryBlocked)
+        }
+    }
+
     @Test fun persistedFingerprintEditUnderSameIdDropsDraftAndGrantBeforeRecovery() = runBlocking<Unit> {
         val first = TaskSession(); val recovered = TaskSession(); val calls = AtomicInteger()
         withOwner(AppServerRuntime { _, _ -> if (calls.getAndIncrement() == 0) first else recovered }) { owner, saved, _ ->

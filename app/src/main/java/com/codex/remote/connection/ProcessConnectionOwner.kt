@@ -89,6 +89,7 @@ class ProcessConnectionOwner(
 
     override fun dialFailed(error: Throwable) { attemptFatal = isFatalConnectionFailure(error) }
     override fun transportLost() { captureTasks(); policy.transportLost(now()); wake.trySend(Unit) }
+    override fun recoveryBlocked() { policy.block(); wake.trySend(Unit) }
 
     /** Invoked by sticky service recreation, never by Activity creation or last-used metadata. */
     fun restoreDesiredConnection() {

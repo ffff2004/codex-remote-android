@@ -138,6 +138,46 @@ class ApprovalClientBehaviorTest {
         assertTrue(huge.canRespond(null, "decline"))
     }
 
+    @Test
+    fun malformedRequestAndResponseIdsAreFatalWithoutTransientFailure() = runBlocking {
+        for (id in listOf("null", "true", "{}", "[]")) {
+            for (response in listOf(false, true)) {
+                val session = session()
+                val client = CodexRpcClient(session)
+                val events = Channel<AppServerEvent>(Channel.UNLIMITED)
+                val subscription = launch(start = CoroutineStart.UNDISPATCHED) { client.events.collect { events.send(it) } }
+                try {
+                    client.initialize()
+                    session.emit(if (response) buildJsonObject {
+                        put("id", Json.parseToJsonElement(id)); put("result", buildJsonObject {})
+                    } else command(Json.parseToJsonElement(id)))
+                    assertTrue(withTimeout(2_000) { events.receive() } is AppServerEvent.FatalProtocolError)
+                    session.completeMessages()
+                    kotlinx.coroutines.delay(25)
+                    assertTrue("Fatal identity $id must not emit transient failure", events.tryReceive().isFailure)
+                } finally { client.close(); subscription.cancel() }
+            }
+        }
+    }
+
+    @Test
+    fun fatalDuplicateApprovalNeverEmitsAnAdditionalTransientFailure() = runBlocking {
+        val session = session()
+        val client = CodexRpcClient(session)
+        val events = Channel<AppServerEvent>(Channel.UNLIMITED)
+        val subscription = launch(start = CoroutineStart.UNDISPATCHED) { client.events.collect { events.send(it) } }
+        try {
+            client.initialize()
+            session.emit(command(JsonPrimitive("same")))
+            assertTrue(withTimeout(2_000) { events.receive() } is AppServerEvent.Approval)
+            val original = command(JsonPrimitive("same"))
+            session.emit(JsonObject(original + ("params" to JsonObject(original["params"]!!.jsonObject + ("command" to JsonPrimitive("different"))))))
+            assertTrue(withTimeout(2_000) { events.receive() } is AppServerEvent.FatalProtocolError)
+            kotlinx.coroutines.delay(25)
+            assertTrue(events.tryReceive().isFailure)
+        } finally { client.close(); subscription.cancel() }
+    }
+
     private fun session() = ChannelBackedAppServerSession(CodexRuntimeVersion("test", "test")) { message ->
         if (message["method"]?.jsonPrimitive?.content == "initialize") buildJsonObject {
             put("id", message["id"]!!); put("result", buildJsonObject {})

@@ -89,4 +89,5 @@ interface ConnectionMaintenance {
     fun disconnectRequested()
     fun dialFailed(error: Throwable)
     fun transportLost()
+    fun recoveryBlocked() {}
 }

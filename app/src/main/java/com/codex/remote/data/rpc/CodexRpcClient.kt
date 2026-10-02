@@ -103,7 +103,9 @@ sealed interface AppServerEvent {
     data class Diagnostic(val message: String) : AppServerEvent
 }
 
-class RpcException(message: String, val code: Int? = null) : Exception(message)
+open class RpcException(message: String, val code: Int? = null) : Exception(message)
+
+private class RpcProtocolException(message: String) : RpcException(message)
 
 class CodexRpcClient(
     private val session: AppServerSession,
@@ -663,6 +665,7 @@ class CodexRpcClient(
                 val params = message.obj("params") ?: buildJsonObject {}
                 if (id != null) {
                     val event = trackedServerRequestEvent(outstandingApprovalRequests, id, method, params)
+                    if (event is AppServerEvent.FatalProtocolError) throw RpcProtocolException(event.message)
                     if (event is AppServerEvent.Approval) {
                         val reviewed = synchronized(approvalReviewLock) {
                             val request = event.request
@@ -674,12 +677,13 @@ class CodexRpcClient(
                         }
                         _events.emit(event.copy(request = reviewed))
                     } else if (event != null) _events.emit(event)
-                    if (event is AppServerEvent.FatalProtocolError) throw RpcException(event.message)
                 } else handleNotification(method, params)
             }
             _events.emit(AppServerEvent.Failure("远端 app-server 已断开"))
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (error: RpcProtocolException) {
+            _events.emit(AppServerEvent.FatalProtocolError(error.message ?: "Invalid app-server protocol"))
         } catch (error: Throwable) {
             _events.emit(AppServerEvent.Failure(error.message ?: "SSH 数据流已中断"))
         } finally {
@@ -738,8 +742,8 @@ class CodexRpcClient(
             "serverRequest/resolved" -> {
                 val event = trackedServerRequestResolvedEvent(outstandingApprovalRequests, params)
                 if (event is AppServerEvent.ApprovalResolved) synchronized(approvalReviewLock) { approvalReviews.remove(event.requestId) }
+                if (event is AppServerEvent.FatalProtocolError) throw RpcProtocolException(event.message)
                 if (event != null) _events.emit(event)
-                if (event is AppServerEvent.FatalProtocolError) throw RpcException(event.message)
             }
             "item/started", "item/completed" -> params.obj("item")?.let(::parseTimelineItem)?.let { item ->
                 val status = item.status.ifBlank {
@@ -883,7 +887,7 @@ class CodexRpcClient(
         }
 
         internal fun requireRequestId(element: JsonElement): RpcRequestId =
-            parseRequestId(element) ?: throw RpcException("Invalid app-server JSON-RPC request id")
+            parseRequestId(element) ?: throw RpcProtocolException("Invalid app-server JSON-RPC request id")
 
         internal fun responseEnvelope(id: RpcRequestId, result: JsonObject): JsonObject = buildJsonObject {
             when (id) {
