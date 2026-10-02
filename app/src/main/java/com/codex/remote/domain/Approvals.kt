@@ -110,6 +110,29 @@ internal fun TimelineItem.fileApprovalSnapshotOrNull(): TimelineItem? {
     )
 }
 
+/** Mutates only the caller's cache. A refused replacement still invalidates its exact live review. */
+internal fun retainLiveFileApprovalSnapshot(
+    cache: MutableMap<ApprovalFileItemKey, TimelineItem>,
+    threadId: String?,
+    item: TimelineItem,
+): TimelineItem? {
+    if (threadId.isNullOrBlank() || item.turnId.isNullOrBlank() || item.id.isBlank() ||
+        item.kind != TimelineKind.FILE_CHANGE || threadId.length > 4_096 ||
+        item.turnId.length > 4_096 || item.id.length > 4_096) return null
+    val key = ApprovalFileItemKey(threadId, item.turnId, item.id)
+    cache.remove(key)
+    val snapshot = item.fileApprovalSnapshotOrNull()
+    if (snapshot != null && cache.size < 200 &&
+        snapshot.approvalFileSnapshotRetainedCharCount <= ApprovalQueue.MAX_RETAINED_CHARS -
+        cache.values.sumOf { it.approvalFileSnapshotRetainedCharCount }) {
+        cache[key] = snapshot
+        return snapshot
+    }
+    // Keep just the matching identity to remove Allow from an already frozen approval.
+    return TimelineItem(id = item.id, kind = TimelineKind.FILE_CHANGE, turnId = item.turnId,
+        status = item.status, fileChangesComplete = false)
+}
+
 internal val TimelineItem.approvalFileSnapshotRetainedCharCount: Long
     get() {
         var retainedChars = 0L

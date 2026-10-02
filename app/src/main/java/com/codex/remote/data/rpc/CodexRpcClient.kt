@@ -3,8 +3,7 @@ package com.codex.remote.data.rpc
 import com.codex.remote.BuildConfig
 import com.codex.remote.data.runtime.AppServerSession
 import com.codex.remote.domain.ApprovalFileItemKey
-import com.codex.remote.domain.fileApprovalSnapshotOrNull
-import com.codex.remote.domain.approvalFileSnapshotRetainedCharCount
+import com.codex.remote.domain.retainLiveFileApprovalSnapshot
 import com.codex.remote.domain.ApprovalContextField
 import com.codex.remote.domain.RpcRequestId
 import com.codex.remote.domain.ApprovalKind
@@ -718,16 +717,9 @@ class CodexRpcClient(
     }
 
     private fun retainLiveFileReview(threadId: String?, item: TimelineItem) {
-        if (threadId == null || item.turnId == null || item.kind != TimelineKind.FILE_CHANGE ||
-            threadId.length > 4_096 || item.turnId.length > 4_096 || item.id.length > 4_096) return
         synchronized(approvalReviewLock) {
-            val key = ApprovalFileItemKey(threadId, item.turnId, item.id)
-            liveFileReviews.remove(key)
-            item.fileApprovalSnapshotOrNull()?.let { snapshot ->
-                if (liveFileReviews.size < 200 && liveFileReviews.values.sumOf { it.approvalFileSnapshotRetainedCharCount } +
-                    snapshot.approvalFileSnapshotRetainedCharCount <= 4L * 1024 * 1024) liveFileReviews[key] = snapshot
-            }
-            approvalReviews.replaceAll { _, request -> request.bindFileChangesSnapshot(threadId, item) }
+            val reviewedItem = retainLiveFileApprovalSnapshot(liveFileReviews, threadId, item) ?: return
+            approvalReviews.replaceAll { _, request -> request.bindFileChangesSnapshot(threadId, reviewedItem) }
         }
     }
 

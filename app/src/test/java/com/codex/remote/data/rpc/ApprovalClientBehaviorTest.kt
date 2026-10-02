@@ -178,6 +178,41 @@ class ApprovalClientBehaviorTest {
         } finally { client.close(); subscription.cancel() }
     }
 
+    @Test
+    fun fullLiveCacheRefusesUnknownPatchAndReplacementInvalidatesPendingAuthorization() = runBlocking {
+        val session = session(); val client = CodexRpcClient(session)
+        val events = Channel<AppServerEvent>(Channel.UNLIMITED)
+        val subscription = launch(start = CoroutineStart.UNDISPATCHED) { client.events.collect { events.send(it) } }
+        fun patch(id: String, diff: String) = buildJsonObject {
+            put("method", "item/started"); put("params", buildJsonObject {
+                put("threadId", "thread-a"); put("turnId", "turn-a")
+                put("item", buildJsonObject { put("id", id); put("type", "fileChange"); put("status", "inProgress")
+                    put("changes", buildJsonArray { add(buildJsonObject {
+                        put("path", "a.kt"); put("kind", buildJsonObject { put("type", "update") }); put("diff", diff)
+                    }) })
+                })
+            })
+        }
+        fun request(id: String, item: String) = Json.parseToJsonElement("""{"id":"$id","method":"item/fileChange/requestApproval","params":{"threadId":"thread-a","turnId":"turn-a","itemId":"$item","cwd":"/srv/app","availableDecisions":["accept","decline"]}}""").jsonObject
+        try {
+            client.initialize()
+            repeat(201) { session.emit(patch("patch-$it", "+new")); withTimeout(2_000) { events.receive() } }
+            session.emit(request("overflow", "patch-200"))
+            val overflow = withTimeout(2_000) { (events.receive() as AppServerEvent.Approval).request }
+            assertFalse(overflow.canRespond("thread-a", "accept"))
+            client.respondToApproval(overflow, "decline")
+            session.emit(patch("patch-0", "+replacement")); withTimeout(2_000) { events.receive() }
+            session.emit(request("retained", "patch-0"))
+            val retained = withTimeout(2_000) { (events.receive() as AppServerEvent.Approval).request }
+            assertTrue(retained.canRespond("thread-a", "accept"))
+            session.emit(patch("patch-0", "x".repeat(32_769))); withTimeout(2_000) { events.receive() }
+            assertTrue(runCatching { client.respondToApproval(retained, "accept") }.isFailure)
+            session.emit(request("invalidated", "patch-0"))
+            val invalidated = withTimeout(2_000) { (events.receive() as AppServerEvent.Approval).request }
+            assertFalse(invalidated.canRespond("thread-a", "accept"))
+        } finally { client.close(); subscription.cancel() }
+    }
+
     private fun session() = ChannelBackedAppServerSession(CodexRuntimeVersion("test", "test")) { message ->
         if (message["method"]?.jsonPrimitive?.content == "initialize") buildJsonObject {
             put("id", message["id"]!!); put("result", buildJsonObject {})

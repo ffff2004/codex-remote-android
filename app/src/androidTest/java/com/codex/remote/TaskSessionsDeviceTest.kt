@@ -405,6 +405,27 @@ class TaskSessionsDeviceTest {
         }
     }
 
+    @Test fun invalidLivePatchReplacementClearsUiCacheAndRemovesFrozenAllow() = runBlocking<Unit> {
+        withViewModel { vm, session ->
+            open(vm, session, "a")
+            fun patch(diff: String) = buildJsonObject { put("method", "item/started"); put("params", buildJsonObject {
+                put("threadId", "a"); put("turnId", "live-a"); put("item", buildJsonObject {
+                    put("id", "patch"); put("type", "fileChange"); put("status", "inProgress")
+                    put("changes", buildJsonArray { add(buildJsonObject { put("path", "a.kt"); put("kind", buildJsonObject { put("type", "update") }); put("diff", diff) }) })
+                })
+            }) }
+            session.emit(patch("+safe"))
+            session.emit(obj("""{"id":"file-review","method":"item/fileChange/requestApproval","params":{"threadId":"a","turnId":"live-a","itemId":"patch","cwd":"/fixture/a","availableDecisions":["accept","decline"]}}"""))
+            await(vm) { it.approvalQueue.current?.canRespond("a", "accept") == true }
+            assertTrue(ApprovalFileItemKey("a", "live-a", "patch") in vm.state.value.approvalFileItems)
+            session.emit(patch("x".repeat(32_769)))
+            await(vm) { it.approvalQueue.current?.canRespond("a", "accept") == false }
+            assertFalse(ApprovalFileItemKey("a", "live-a", "patch") in vm.state.value.approvalFileItems)
+            assertTrue(vm.state.value.approvalQueue.current!!.canRespond("a", "decline"))
+            assertEquals(0, session.approvalReplies)
+        }
+    }
+
     private suspend fun paginationDuringResume(historyFirst: Boolean) {
         withViewModel { vm, session ->
             open(vm, session, "a")

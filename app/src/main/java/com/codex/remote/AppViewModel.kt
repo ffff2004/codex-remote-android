@@ -40,8 +40,7 @@ import com.codex.remote.domain.ApprovalDelivery
 import com.codex.remote.domain.ApprovalEnqueueStatus
 import com.codex.remote.domain.ApprovalFileItemKey
 import com.codex.remote.domain.canRespond
-import com.codex.remote.domain.fileApprovalSnapshotOrNull
-import com.codex.remote.domain.approvalFileSnapshotRetainedCharCount
+import com.codex.remote.domain.retainLiveFileApprovalSnapshot
 import com.codex.remote.domain.ConnectionDraft
 import com.codex.remote.domain.ConnectionStatus
 import com.codex.remote.domain.ComposerMention
@@ -1594,18 +1593,11 @@ class AppViewModel @JvmOverloads constructor(
     }
 
     private fun retainApprovalFileItem(threadId: String?, item: TimelineItem) {
-        if (threadId.isNullOrBlank() || item.kind != TimelineKind.FILE_CHANGE || item.turnId.isNullOrBlank() ||
-            threadId.length > 4_096 || item.turnId.length > 4_096 || item.id.length > 4_096) return
-        val key = ApprovalFileItemKey(threadId, item.turnId, item.id)
         _state.update { state ->
             val cache = state.approvalFileItems.toMutableMap()
-            cache.remove(key)
-            item.fileApprovalSnapshotOrNull()?.let { snapshot ->
-                if (cache.size < 200 && cache.values.sumOf { it.approvalFileSnapshotRetainedCharCount } +
-                    snapshot.approvalFileSnapshotRetainedCharCount <= ApprovalQueue.MAX_RETAINED_CHARS) cache[key] = snapshot
-            }
+            val reviewedItem = retainLiveFileApprovalSnapshot(cache, threadId, item) ?: return@update state
             state.copy(approvalFileItems = cache.toMap(),
-                approvalQueue = state.approvalQueue.bindFileChangeSnapshot(threadId, item))
+                approvalQueue = state.approvalQueue.bindFileChangeSnapshot(requireNotNull(threadId), reviewedItem))
         }
     }
 
