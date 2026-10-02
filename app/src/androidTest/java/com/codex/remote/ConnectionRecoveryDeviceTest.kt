@@ -147,6 +147,42 @@ class ConnectionRecoveryDeviceTest {
         }
     }
 
+    @Test fun changedPersistedTrustMakesNewTaskRequestsSafeAndRejectsOldConfirmation() = runBlocking<Unit> {
+        val first = TaskSession(); val recovered = TaskSession(); val calls = AtomicInteger()
+        withOwner(AppServerRuntime { _, _ -> if (calls.getAndIncrement() == 0) first else recovered }) { owner, saved, _ ->
+            val vm = owner.viewModel
+            onMain { vm.connect(saved) }; await(vm) { it.connectionStatus == ConnectionStatus.CONNECTED }
+            open(vm, first, "a")
+            onMain { vm.setPermissionMode(PermissionMode.FULL_ACCESS) }
+            val oldConfirmation = vm.state.value.fullAccessConfirmation!!
+            onMain { vm.confirmFullAccess(oldConfirmation) }
+            assertEquals("never", vm.state.value.approvalPolicy)
+            val changed = ConnectionStore(app).save(ConnectionDraft(id = saved.id, name = saved.name, host = saved.host,
+                username = saved.username, hostKeyFingerprint = "SHA256:new-owner"), saved)
+            await(vm) { it.activeConnection?.hostKeyFingerprint == changed.hostKeyFingerprint }
+            first.close()
+            await(vm) { calls.get() == 2 && it.connectionStatus == ConnectionStatus.CONNECTED && it.remoteAccount != null }
+            assertNull(vm.state.value.selectedThreadId)
+            onMain { vm.confirmFullAccess(oldConfirmation); vm.sendMessage("safe new task") }
+            val start = withTimeout(5000) { recovered.starts.receive() }
+            recovered.respond(start, obj("""{"thread":{"id":"new-task","cwd":"/fixture/a"},"model":"model"}"""))
+            val turn = withTimeout(5000) { recovered.turnWrites.receive() }
+            val startParams = start["params"]!!.jsonObject; val turnParams = turn["params"]!!.jsonObject
+            assertEquals("on-request", startParams["approvalPolicy"]!!.jsonPrimitive.content)
+            assertEquals("on-request", turnParams["approvalPolicy"]!!.jsonPrimitive.content)
+            assertEquals(":workspace", startParams["permissions"]!!.jsonPrimitive.content)
+            assertEquals(":workspace", turnParams["permissions"]!!.jsonPrimitive.content)
+            assertFalse(startParams.toString().contains("danger-full-access"))
+            assertFalse(turnParams.toString().contains("danger-full-access"))
+            recovered.respond(turn, obj("""{"turn":{"id":"safe-turn"}}"""))
+            onMain { vm.disconnect() }
+            await(vm) { it.activeConnection == null }
+            assertEquals(":workspace", vm.state.value.selectedPermissionProfile)
+            assertEquals("on-request", vm.state.value.approvalPolicy)
+            assertEquals("user", vm.state.value.approvalsReviewer)
+        }
+    }
+
     @Test fun persistedFingerprintEditUnderSameIdDropsDraftAndGrantBeforeRecovery() = runBlocking<Unit> {
         val first = TaskSession(); val recovered = TaskSession(); val calls = AtomicInteger()
         withOwner(AppServerRuntime { _, _ -> if (calls.getAndIncrement() == 0) first else recovered }) { owner, saved, _ ->
