@@ -1,0 +1,99 @@
+name: Android Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.deleted == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+
+      - name: Check release version
+        env:
+          CODEX_REMOTE_RELEASE_TAG: ${{ github.ref_name }}
+        run: bash ./gradlew --no-daemon :app:verifyReleaseVersion
+
+      - name: Verify
+        run: |
+          bash .github/scripts/test-publish-release.sh
+          bash ./gradlew --no-daemon testDebugUnitTest lintDebug
+
+      - name: Build signed APK and verify certificate
+        env:
+          CODEX_REMOTE_KEYSTORE_BASE64: ${{ secrets.CODEX_REMOTE_KEYSTORE_BASE64 }}
+          CODEX_REMOTE_KEYSTORE_PATH: ${{ runner.temp }}/codex-remote-release.jks
+          CODEX_REMOTE_KEYSTORE_PASSWORD: ${{ secrets.CODEX_REMOTE_KEYSTORE_PASSWORD }}
+          CODEX_REMOTE_KEY_ALIAS: ${{ secrets.CODEX_REMOTE_KEY_ALIAS }}
+          CODEX_REMOTE_KEY_PASSWORD: ${{ secrets.CODEX_REMOTE_KEY_PASSWORD }}
+          CODEX_REMOTE_SIGNING_CERT_SHA256: ${{ vars.CODEX_REMOTE_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          for name in CODEX_REMOTE_KEYSTORE_BASE64 CODEX_REMOTE_KEYSTORE_PASSWORD \
+            CODEX_REMOTE_KEY_ALIAS CODEX_REMOTE_KEY_PASSWORD CODEX_REMOTE_SIGNING_CERT_SHA256; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing release signing setting: $name"
+              exit 1
+            fi
+          done
+          expected="${CODEX_REMOTE_SIGNING_CERT_SHA256,,}"
+          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::CODEX_REMOTE_SIGNING_CERT_SHA256 must contain 64 hexadecimal characters."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$CODEX_REMOTE_KEYSTORE_BASE64" | base64 --decode > "$CODEX_REMOTE_KEYSTORE_PATH"
+          bash ./gradlew --no-daemon assembleRelease
+
+          apk=app/build/outputs/apk/release/app-release.apk
+          metadata=app/build/outputs/apk/release/output-metadata.json
+          jq -e --arg version "${TAG#v}" '
+            .applicationId == "com.codex.remote" and .variantName == "release" and
+            (.elements | length == 1) and .elements[0].versionName == $version and
+            .elements[0].versionCode > 0 and .elements[0].outputFile == "app-release.apk"
+          ' "$metadata"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" \
+            > "$RUNNER_TEMP/codex-remote-signature.txt"
+          cat "$RUNNER_TEMP/codex-remote-signature.txt"
+          actual="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/codex-remote-signature.txt")"
+          if [[ "${actual,,}" != "$expected" ]]; then
+            echo "::error::APK signing certificate does not match CODEX_REMOTE_SIGNING_CERT_SHA256."
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$apk" "dist/codex-remote-$TAG.apk"
+          (cd dist && sha256sum "codex-remote-$TAG.apk" > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/scripts/publish-release.sh "$TAG" dist
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/codex-remote-release.jks"

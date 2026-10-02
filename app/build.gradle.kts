@@ -84,6 +84,23 @@ android {
     }
 }
 
+tasks.register("verifyReleaseVersion") {
+    group = "verification"
+    description = "Check that the release tag matches the APK version."
+    doLast {
+        val tag = providers.environmentVariable("CODEX_REMOTE_RELEASE_TAG").orNull
+        require(tag != null && tag.matches(Regex("v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?"))) {
+            "CODEX_REMOTE_RELEASE_TAG must be vMAJOR.MINOR.PATCH, optionally with a prerelease suffix."
+        }
+        require(tag.removePrefix("v") == android.defaultConfig.versionName) {
+            "Release tag $tag does not match versionName ${android.defaultConfig.versionName}."
+        }
+        require((android.defaultConfig.versionCode ?: 0) > 0) {
+            "A release must have a positive versionCode."
+        }
+    }
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)

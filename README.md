@@ -1,6 +1,6 @@
 # Codex Remote for Android
 
-[![Android CI](https://github.com/liuaho6-commits/codex-remote-android/actions/workflows/android.yml/badge.svg)](https://github.com/liuaho6-commits/codex-remote-android/actions/workflows/android.yml)
+[![Android CI](https://github.com/ffff2004/codex-remote-android/actions/workflows/android.yml/badge.svg)](https://github.com/ffff2004/codex-remote-android/actions/workflows/android.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An Android client for Codex hosts reached over SSH. A saved connection represents
@@ -79,7 +79,7 @@ Task pins are stored on the remote Codex thread rather than only on Android.
 ## Install
 
 Download the signed APK from the latest
-[GitHub release](https://github.com/liuaho6-commits/codex-remote-android/releases/latest).
+[GitHub release](https://github.com/ffff2004/codex-remote-android/releases/latest).
 Android may ask you to allow installation from your browser or file manager.
 
 The project is an unofficial community client. It is not affiliated with or
@@ -116,6 +116,86 @@ CODEX_REMOTE_KEY_PASSWORD
 
 Signing material must remain outside the repository. APKs, keystores, local SDK
 configuration, build caches, and QA captures are excluded by `.gitignore`.
+
+## Release
+
+Pushing a version tag triggers [Android Release](.github/workflows/release.yml).
+The workflow checks that the tag matches `versionName`, runs unit tests and lint,
+builds a signed APK, and verifies its signing certificate. It then creates a
+draft GitHub Release, uploads the APK and `SHA256SUMS`, and publishes the release
+only after both uploads succeed. Tags with a suffix such as `v0.1.3-rc.1` create
+pre-releases; the APK's `versionName` must also include that suffix.
+
+### One-time signing setup
+
+Reuse the keystore used by `~/.local/sbin/codex-remote-build release` so existing
+installations can upgrade. In the publishing repository's **Settings → Secrets
+and variables → Actions**, configure these repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `CODEX_REMOTE_KEYSTORE_BASE64` | Base64-encoded existing `release.jks` |
+| `CODEX_REMOTE_KEYSTORE_PASSWORD` | Existing keystore password |
+| `CODEX_REMOTE_KEY_ALIAS` | Existing signing key alias |
+| `CODEX_REMOTE_KEY_PASSWORD` | Existing key password |
+
+For example, upload the keystore without printing its contents:
+
+```bash
+base64 -w 0 ~/.local/share/codex-remote-keys/release.jks |
+  gh secret set CODEX_REMOTE_KEYSTORE_BASE64 --repo ffff2004/codex-remote-android
+```
+
+Use the GitHub settings page or `gh secret set NAME --repo
+ffff2004/codex-remote-android` to enter the other secrets interactively. The local
+build script uses the same password for the keystore and key; set both password
+secrets to that value if using the same signing material.
+
+Also configure the repository **variable** `CODEX_REMOTE_SIGNING_CERT_SHA256`:
+the existing APK signer's certificate SHA-256 digest, as 64 hexadecimal
+characters without colons. Obtain it from a locally signed APK:
+
+```bash
+~/.local/sbin/codex-remote-build release
+~/Android/Sdk/build-tools/35.0.0/apksigner verify --print-certs \
+  app/build/outputs/apk/release/app-release.apk
+```
+
+Copy the value on the `Signer #1 certificate SHA-256 digest:` line. This is the
+certificate fingerprint, not the APK file checksum. Signing material stays in
+the runner's temporary directory and is removed even if a later step fails.
+Release uploads use `GITHUB_TOKEN` with `contents: write`; no extra PAT is needed.
+
+### Publish a version
+
+1. Update `versionName` and increment `versionCode` in `app/build.gradle.kts`.
+   Commit and push the change, including the release workflow on first setup,
+   and wait for Android CI to pass.
+2. Tag that commit and push the tag. For example, after setting `versionName` to
+   `0.1.3` and `versionCode` to `4`:
+
+   ```bash
+   git switch main
+   git pull --ff-only
+   git tag -a v0.1.3 -m "Release v0.1.3"
+   git push origin v0.1.3
+   ```
+
+3. Follow Android Release in the Actions tab. The resulting release contains
+   `codex-remote-v0.1.3.apk` and `SHA256SUMS`.
+
+If a test, build, or signature check fails, no release is created. If uploading
+fails, the release remains a draft; fix the external cause and rerun the failed
+workflow. An existing draft is reused and its assets can be replaced. Already
+published releases are never overwritten. A rerun uses the original tagged
+code: source or workflow fixes need a new commit and version tag. Each new
+installable version, including a pre-release, should increment `versionCode`.
+
+To check the publishing logic locally without contacting GitHub:
+
+```bash
+bash .github/scripts/test-publish-release.sh
+```
 
 ## License
 
