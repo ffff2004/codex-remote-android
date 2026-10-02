@@ -124,6 +124,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -163,6 +164,9 @@ import com.codex.remote.domain.ComposerMentionKind
 import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerTriggerKind
 import com.codex.remote.domain.FileChangeSummary
+import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.TaskComposer
+import com.codex.remote.domain.TaskIndicator
 import com.codex.remote.domain.PermissionMode
 import com.codex.remote.domain.RemoteProject
 import com.codex.remote.domain.RemoteDeviceLogin
@@ -230,6 +234,7 @@ fun WorkspaceScreen(
     onSetCollaborationMode: (String) -> Unit,
     onSetPermissionProfile: (String?) -> Unit,
     onSetPermissionMode: (PermissionMode) -> Unit,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
     onLoadRemoteDirectory: (String) -> Unit,
     onClearRemoteDirectory: () -> Unit,
     onStartLogin: () -> Unit,
@@ -238,7 +243,17 @@ fun WorkspaceScreen(
     onTrustHostKey: () -> Unit,
     onRejectHostKey: () -> Unit,
     onDismissNotice: () -> Unit,
+    onConfirmFullAccess: (FullAccessConfirmation) -> Unit = {},
+    onCancelFullAccess: () -> Unit = {},
 ) {
+    state.fullAccessConfirmation?.let { confirmation ->
+        AlertDialog(onDismissRequest = onCancelFullAccess,
+            title = { Text("确认完全访问") },
+            text = { Text("仅对任务 ${confirmation.threadId} 启用完全访问。Codex 将无需逐项审批即可读写文件和执行命令。" +
+                if (state.isTurnRunning) " 当前 turn 保持原权限；下个 turn 生效。" else "") },
+            confirmButton = { TextButton(onClick = { onConfirmFullAccess(confirmation) }) { Text("确认完全访问") } },
+            dismissButton = { TextButton(onClick = onCancelFullAccess) { Text("取消") } })
+    }
     val drawerState = androidx.compose.material3.rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
@@ -304,6 +319,7 @@ fun WorkspaceScreen(
                     onSetCollaborationMode = onSetCollaborationMode,
                     onSetPermissionProfile = onSetPermissionProfile,
                     onSetPermissionMode = onSetPermissionMode,
+                    onUpdateComposer = onUpdateComposer,
                     onLoadRemoteDirectory = onLoadRemoteDirectory,
                     onClearRemoteDirectory = onClearRemoteDirectory,
                     onStartLogin = onStartLogin,
@@ -380,6 +396,7 @@ fun WorkspaceScreen(
                     onSetCollaborationMode = onSetCollaborationMode,
                     onSetPermissionProfile = onSetPermissionProfile,
                     onSetPermissionMode = onSetPermissionMode,
+                    onUpdateComposer = onUpdateComposer,
                     onLoadRemoteDirectory = onLoadRemoteDirectory,
                     onClearRemoteDirectory = onClearRemoteDirectory,
                     onStartLogin = onStartLogin,
@@ -558,6 +575,7 @@ private fun WorkspaceSidebar(
                     val expanded = searchQuery.isNotBlank() || expandedProjects[project.id] == true
                     Row(
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
+                            .testTag("sidebar-project-${project.id}")
                             .clickable { expandedProjects[project.id] = !expanded }
                             .padding(horizontal = 10.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -611,6 +629,7 @@ private fun WorkspaceSidebar(
                     items(project.threads, key = { "thread-${it.id}" }) { thread ->
                         ThreadSidebarRow(
                             thread = thread,
+                                indicator = state.taskIndicators[thread.id] ?: TaskIndicator(),
                             selected = thread.id == state.selectedThreadId,
                             onSelect = { onSelectThread(thread) },
                             onRename = { onRenameThread(thread) },
@@ -659,6 +678,7 @@ private fun WorkspaceSidebar(
 @Composable
 private fun ThreadSidebarRow(
     thread: RemoteThread,
+    indicator: TaskIndicator = TaskIndicator(),
     selected: Boolean,
     onSelect: () -> Unit,
     onRename: () -> Unit,
@@ -666,6 +686,12 @@ private fun ThreadSidebarRow(
     onSetPinned: (Boolean) -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    val markers = buildList {
+        if (indicator.running || thread.status.contains("active", true)) add("Running")
+        if (indicator.approval) add("Approval")
+        if (indicator.failed) add("Failed")
+        if (indicator.unread > 0) add("Unread ${indicator.unread}")
+    }
     Row(
         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
             .background(if (selected) MaterialTheme.colorScheme.surface else Color.Transparent)
@@ -688,6 +714,8 @@ private fun ThreadSidebarRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
             )
+            if (markers.isNotEmpty()) Text(markers.joinToString(" · "), style = MaterialTheme.typography.labelSmall,
+                color = if (indicator.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary)
         }
         if (thread.isPinned) {
             Icon(
@@ -697,9 +725,6 @@ private fun ThreadSidebarRow(
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.width(4.dp))
-        }
-        if (thread.status.contains("active", true)) {
-            Box(Modifier.size(6.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondary))
         }
         Box {
             IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(34.dp)) {
@@ -825,6 +850,7 @@ private fun WorkspaceContent(
     onSetCollaborationMode: (String) -> Unit,
     onSetPermissionProfile: (String?) -> Unit,
     onSetPermissionMode: (PermissionMode) -> Unit,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
     onLoadRemoteDirectory: (String) -> Unit,
     onClearRemoteDirectory: () -> Unit,
     onStartLogin: () -> Unit,
@@ -981,6 +1007,7 @@ private fun WorkspaceContent(
                             onSetCollaborationMode = onSetCollaborationMode,
                             onSetPermissionProfile = onSetPermissionProfile,
                             onSetPermissionMode = onSetPermissionMode,
+                    onUpdateComposer = onUpdateComposer,
                             onLoadRemoteDirectory = onLoadRemoteDirectory,
                             onClearRemoteDirectory = onClearRemoteDirectory,
                             modifier = Modifier.fillMaxWidth(),
@@ -1504,6 +1531,11 @@ private fun TimelineRow(item: TimelineItem, modifier: Modifier) {
             ) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 11.dp)) {
                     SelectionContainer { Text(item.body, style = MaterialTheme.typography.bodyLarge) }
+                    if (item.id.startsWith("local-") && item.status in setOf("awaiting confirmation", "delivery uncertain")) {
+                        Spacer(Modifier.height(5.dp))
+                        Text(if (item.status == "delivery uncertain") "发送结果不确定；不会自动重发" else "等待远端消息确认",
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     if (item.isGoal) {
                         Spacer(Modifier.height(7.dp))
                         Row(
@@ -1933,25 +1965,34 @@ private fun Composer(
     onLoadRemoteDirectory: (String) -> Unit,
     onClearRemoteDirectory: () -> Unit,
     modifier: Modifier = Modifier,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
 ) {
-    var text by remember(state.selectedThreadId) { mutableStateOf(TextFieldValue()) }
-    var selectedMentions by remember(state.selectedThreadId) { mutableStateOf(emptyList<ComposerMention>()) }
-    var attachments by remember(state.selectedThreadId) { mutableStateOf(emptyList<ComposerImageAttachment>()) }
+    var text by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(TextFieldValue(state.composer.text, TextRange(state.composer.cursor.coerceIn(0, state.composer.text.length)))) }
+    var selectedMentions by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(state.composer.mentions) }
+    var attachments by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(state.composer.attachments) }
     var attachmentError by remember(state.selectedThreadId) { mutableStateOf<String?>(null) }
     var mentionKindFilter by remember(state.selectedThreadId) { mutableStateOf<ComposerMentionKind?>(null) }
     var modelSettingsMenu by remember(state.selectedThreadId) { mutableStateOf(false) }
     var modelSettingsPage by remember(state.selectedThreadId) { mutableStateOf(ModelSettingsPage.ROOT) }
     var addMenuOpen by remember(state.selectedThreadId) { mutableStateOf(false) }
     var showRemotePathPicker by remember(state.selectedThreadId) { mutableStateOf(false) }
-    var goalModeActive by remember(state.selectedThreadId) { mutableStateOf(false) }
+    var goalModeActive by remember(state.activeConnection?.id, state.selectedThreadId) { mutableStateOf(state.composer.goalMode) }
+    val composerOwner = state.selectedThreadId
+    val composerEpoch = state.taskSelectionEpoch
+    val currentComposerEpoch by rememberUpdatedState(composerEpoch)
+    LaunchedEffect(state.activeConnection?.id, composerOwner, text, selectedMentions, attachments, goalModeActive) {
+        onUpdateComposer(composerOwner, composerEpoch, TaskComposer(text.text, text.selection.end, selectedMentions, attachments, goalModeActive))
+    }
     var policyMenu by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val composerScope = rememberCoroutineScope()
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri ?: return@rememberLauncherForActivityResult
+        val imageEpoch = composerEpoch
         composerScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { readComposerImageAttachment(context, uri) } }
             result.onSuccess { attachment ->
+                if (imageEpoch != currentComposerEpoch) return@onSuccess
                 attachments = (attachments + attachment).takeLast(MAX_COMPOSER_IMAGES)
                 attachmentError = null
             }.onFailure { error ->
@@ -3305,6 +3346,7 @@ private fun PermissionDropdown(
     properties: PopupProperties,
     onDismiss: () -> Unit,
     onSetPermissionMode: (PermissionMode) -> Unit,
+    onUpdateComposer: (String?, Long, TaskComposer) -> Unit = { _, _, _ -> },
     onSetPermissionProfile: (String) -> Unit,
 ) {
     val selectedMode = permissionModeFor(

@@ -236,6 +236,8 @@ data class RemoteDeviceLogin(
 )
 
 data class RemoteThreadSession(
+    val activeTurnId: String? = null,
+    val isTurnRunning: Boolean = false,
     val timeline: List<TimelineItem>,
     val model: String?,
     val reasoningEffort: String?,
@@ -346,6 +348,7 @@ data class TimelineItem(
     val isGoal: Boolean = false,
     val turnId: String? = null,
     val fileChangesComplete: Boolean = false,
+    val clientId: String? = null,
 )
 
 data class FileChangeSummary(
@@ -357,7 +360,21 @@ data class FileChangeSummary(
 
 enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
 
+data class TaskRecoveryTarget(val threadId: String, val cwd: String, val running: Boolean,
+    val activeGoal: Boolean, val approval: Boolean, val pendingWrite: Boolean)
+
+data class TaskIndicator(val running: Boolean = false, val approval: Boolean = false, val failed: Boolean = false, val unread: Int = 0)
+
+data class FullAccessConfirmation(val connectionGeneration: Long, val hostKey: String, val threadId: String)
+
+data class TaskComposer(val text: String = "", val cursor: Int = 0, val mentions: List<ComposerMention> = emptyList(), val attachments: List<ComposerImageAttachment> = emptyList(), val goalMode: Boolean = false)
+
 data class AppUiState(
+    val taskSelectionEpoch: Long = 0,
+    val taskIndicators: Map<String, TaskIndicator> = emptyMap(),
+    val composer: TaskComposer = TaskComposer(),
+    val fullAccessConfirmation: FullAccessConfirmation? = null,
+    val recoveryBlocked: Boolean = false,
     val savedConnections: List<SavedConnection> = emptyList(),
     val activeConnection: SavedConnection? = null,
     val connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED,
@@ -462,14 +479,14 @@ internal fun mergeTimelineHistory(
     older: List<TimelineItem>,
     newer: List<TimelineItem>,
 ): List<TimelineItem> {
-    val newerById = newer.associateBy(TimelineItem::id)
-    val seen = mutableSetOf<String>()
+    val newerById = newer.associateBy { it.turnId to it.id }
+    val seen = mutableSetOf<Pair<String?, String>>()
     return buildList(older.size + newer.size) {
         older.forEach { item ->
-            if (seen.add(item.id)) add(newerById[item.id] ?: item)
+            if (seen.add(item.turnId to item.id)) add(newerById[item.turnId to item.id] ?: item)
         }
         newer.forEach { item ->
-            if (seen.add(item.id)) add(item)
+            if (seen.add(item.turnId to item.id)) add(item)
         }
     }
 }

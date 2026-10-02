@@ -636,4 +636,3 @@ private fun JsonElement?.isJsonLong(): Boolean =
 private fun JsonObject.boolean(key: String): Boolean = (this[key] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull() ?: false
 private fun JsonObject.booleanOrDefault(key: String, default: Boolean): Boolean =
     (this[key] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull() ?: default
-

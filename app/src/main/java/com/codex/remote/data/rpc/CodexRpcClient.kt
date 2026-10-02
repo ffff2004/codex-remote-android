@@ -70,10 +70,10 @@ import java.util.concurrent.atomic.AtomicLong
 
 sealed interface AppServerEvent {
     data class ItemUpsert(val threadId: String?, val item: TimelineItem) : AppServerEvent
-    data class AgentDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
-    data class PlanDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
-    data class ReasoningDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
-    data class OutputDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
+    data class AgentDelta(val threadId: String?, val itemId: String, val delta: String, val turnId: String? = null) : AppServerEvent
+    data class PlanDelta(val threadId: String?, val itemId: String, val delta: String, val turnId: String? = null) : AppServerEvent
+    data class ReasoningDelta(val threadId: String?, val itemId: String, val delta: String, val turnId: String? = null) : AppServerEvent
+    data class OutputDelta(val threadId: String?, val itemId: String, val delta: String, val turnId: String? = null) : AppServerEvent
     data class TurnRunning(
         val threadId: String?,
         val running: Boolean,
@@ -97,7 +97,7 @@ sealed interface AppServerEvent {
         val settings: RemoteThreadSettingsSnapshot,
     ) : AppServerEvent
     data class LoginCompleted(val success: Boolean, val error: String?) : AppServerEvent
-    data class Failure(val message: String, val threadId: String? = null) : AppServerEvent
+    data class Failure(val message: String, val threadId: String? = null, val turnId: String? = null) : AppServerEvent
     data class Warning(val message: String) : AppServerEvent
     data class Diagnostic(val message: String) : AppServerEvent
 }
@@ -110,6 +110,7 @@ class CodexRpcClient(
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val requestId = AtomicLong(1)
     private val pending = ConcurrentHashMap<RpcRequestId, CompletableDeferred<JsonObject>>()
+    val pendingRequestCount: Int get() = pending.size
     private val outstandingApprovalRequests = OutstandingApprovalRequests()
     private val approvalReviewLock = Any()
     private val approvalReviews = mutableMapOf<RpcRequestId, ApprovalRequest>()
@@ -336,9 +337,7 @@ class CodexRpcClient(
         return ForkedRemoteThread(
             thread = thread,
             session = RemoteThreadSession(
-                timeline = threadObject?.array("turns").orEmpty()
-                    .flatMap { it.asObject()?.array("items").orEmpty() }
-                    .mapNotNull(::parseTimelineItem),
+                timeline = parseTurnsTimeline(threadObject?.array("turns").orEmpty(), descending = false),
                 model = result.string("model") ?: model,
                 reasoningEffort = result.string("reasoningEffort"),
                 serviceTier = result.string("serviceTier") ?: serviceTier,
@@ -503,6 +502,13 @@ class CodexRpcClient(
         timeline: List<TimelineItem>,
         olderHistoryCursor: String? = null,
     ) = RemoteThreadSession(
+        activeTurnId = (result.obj("initialTurnsPage")?.array("data").orEmpty() + thread?.array("turns").orEmpty())
+            .mapNotNull { it.asObject() }.filter { it.string("status") == "inProgress" }
+            .mapNotNull { it.strictNonBlankString("id") }.distinct().singleOrNull(),
+        isTurnRunning = thread?.obj("status")?.string("type") == "active" ||
+            thread?.string("status") == "active" ||
+            (result.obj("initialTurnsPage")?.array("data").orEmpty() + thread?.array("turns").orEmpty())
+                .any { it.asObject()?.string("status") == "inProgress" },
         timeline = timeline,
         model = result.string("model"),
         reasoningEffort = result.string("reasoningEffort"),
@@ -539,8 +545,9 @@ class CodexRpcClient(
         collaborationMode: RemoteCollaborationMode?,
         mentions: List<ComposerMention> = emptyList(),
         attachments: List<ComposerImageAttachment> = emptyList(),
-    ) {
-        request(
+        clientUserMessageId: String? = null,
+    ): String {
+        val result = request(
             "turn/start",
             turnStartParams(
                 threadId,
@@ -555,8 +562,10 @@ class CodexRpcClient(
                 collaborationMode,
                 mentions,
                 attachments,
+                clientUserMessageId,
             ),
         )
+        return result.obj("turn")?.strictNonBlankString("id") ?: throw RpcException("turn/start did not return exact turn.id")
     }
 
     suspend fun steerTurn(
@@ -565,11 +574,13 @@ class CodexRpcClient(
         text: String,
         mentions: List<ComposerMention> = emptyList(),
         attachments: List<ComposerImageAttachment> = emptyList(),
-    ) {
-        request(
+        clientUserMessageId: String? = null,
+    ): String {
+        val result = request(
             "turn/steer",
-            turnSteerParams(threadId, expectedTurnId, text, mentions, attachments),
+            turnSteerParams(threadId, expectedTurnId, text, mentions, attachments, clientUserMessageId),
         )
+        return result.strictNonBlankString("turnId") ?: throw RpcException("turn/steer did not return exact turnId")
     }
 
     suspend fun interruptTurn(threadId: String, turnId: String) {
@@ -742,6 +753,7 @@ class CodexRpcClient(
                     params.string("threadId"),
                     params.string("itemId").orEmpty(),
                     params.string("delta").orEmpty(),
+                    turnId = params.strictNonBlankString("turnId"),
                 ),
             )
             "item/plan/delta" -> _events.emit(
@@ -749,6 +761,7 @@ class CodexRpcClient(
                     params.string("threadId"),
                     params.string("itemId").orEmpty(),
                     params.string("delta").orEmpty(),
+                    turnId = params.strictNonBlankString("turnId"),
                 ),
             )
             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta" -> _events.emit(
@@ -756,6 +769,7 @@ class CodexRpcClient(
                     params.string("threadId"),
                     params.string("itemId").orEmpty(),
                     params.string("delta").orEmpty(),
+                    turnId = params.strictNonBlankString("turnId"),
                 ),
             )
             "item/commandExecution/outputDelta" -> _events.emit(
@@ -763,6 +777,7 @@ class CodexRpcClient(
                     params.string("threadId"),
                     params.string("itemId").orEmpty(),
                     params.string("delta").orEmpty(),
+                    turnId = params.strictNonBlankString("turnId"),
                 ),
             )
             "turn/diff/updated" -> Unit
@@ -777,7 +792,7 @@ class CodexRpcClient(
                 val turn = params.obj("turn")
                 val turnError = turn?.obj("error")?.string("message")
                 val threadId = params.string("threadId")
-                if (!turnError.isNullOrBlank()) _events.emit(AppServerEvent.Failure(turnError, threadId))
+                if (!turnError.isNullOrBlank()) _events.emit(AppServerEvent.Failure(turnError, threadId, turn?.string("id")))
                 _events.emit(AppServerEvent.TurnRunning(threadId, false, turn?.string("id")))
             }
             "account/updated" -> _events.emit(AppServerEvent.AccountChanged)
@@ -844,6 +859,7 @@ class CodexRpcClient(
                     AppServerEvent.Failure(
                         error?.string("message") ?: "Codex turn 执行失败",
                         params.string("threadId"),
+                        params.strictNonBlankString("turnId"),
                     ),
                 )
             }
@@ -1142,8 +1158,10 @@ class CodexRpcClient(
             collaborationMode: RemoteCollaborationMode? = null,
             mentions: List<ComposerMention>,
             attachments: List<ComposerImageAttachment> = emptyList(),
+            clientUserMessageId: String? = null,
         ): JsonObject = buildJsonObject {
             put("threadId", threadId)
+            clientUserMessageId?.let { put("clientUserMessageId", it) }
             if (cwd.isNotBlank()) put("cwd", cwd)
             put("approvalPolicy", approvalPolicy)
             put("approvalsReviewer", approvalsReviewer)
@@ -1167,8 +1185,10 @@ class CodexRpcClient(
             text: String,
             mentions: List<ComposerMention>,
             attachments: List<ComposerImageAttachment>,
+            clientUserMessageId: String? = null,
         ): JsonObject = buildJsonObject {
             put("threadId", threadId)
+            clientUserMessageId?.let { put("clientUserMessageId", it) }
             put("expectedTurnId", expectedTurnId)
             put("input", userInputs(text, mentions, attachments))
         }
@@ -1381,8 +1401,7 @@ class CodexRpcClient(
         internal fun parseTimelineItem(element: JsonElement): TimelineItem? {
             val item = element.asObject() ?: return null
             val type = item.strictNonBlankString("type") ?: return null
-            val id = if (type == "fileChange") item.strictNonBlankString("id") ?: return null
-                else item.string("id") ?: "$type-${item.hashCode()}"
+            val id = item.strictNonBlankString("id") ?: return null
             return when (type) {
                 "userMessage" -> TimelineItem(
                     id,
@@ -1398,6 +1417,7 @@ class CodexRpcClient(
                         }
                     }.joinToString("\n"),
                     isGoal = item.boolean("goal"),
+                    clientId = item.strictNonBlankString("clientId"),
                 )
                 "agentMessage" -> TimelineItem(id, TimelineKind.AGENT, body = item.string("text").orEmpty())
                 "reasoning" -> TimelineItem(

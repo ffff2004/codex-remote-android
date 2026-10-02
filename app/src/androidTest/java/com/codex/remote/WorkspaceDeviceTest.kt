@@ -42,6 +42,9 @@ import com.codex.remote.domain.AuthType
 import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.FileChangeSummary
+import com.codex.remote.domain.FullAccessConfirmation
+import com.codex.remote.domain.TaskComposer
+import com.codex.remote.domain.TaskIndicator
 import com.codex.remote.domain.PermissionMode
 import com.codex.remote.domain.ReasoningEffortOption
 import com.codex.remote.domain.RemoteAccount
@@ -199,6 +202,8 @@ class WorkspaceDeviceTest {
         val state = mutableStateOf(baseState(timeline = runningTimeline, isTurnRunning = true))
         show(state)
 
+        // A user scroll leaves follow-latest mode before the programmatic item search.
+        composeRule.onNodeWithTag(CONVERSATION_LIST).performTouchInput { swipeDown() }
         scrollTo("timeline-tool-body-reasoning")
         composeRule.onNodeWithText("private reasoning").assertIsDisplayed()
         scrollTo("timeline-tool-body-command-group:cmd-1")
@@ -510,6 +515,55 @@ val answer = 42
         composeRule.onAllNodesWithText("{\"changes\"", substring = true).assertCountEquals(0)
     }
 
+    @Test fun fullAccessDialogExplainsScopeAndPassesCapturedConfirmation() {
+        val confirmation = FullAccessConfirmation(7, "tester@host:22", "thread-a")
+        val state = mutableStateOf(baseState(isTurnRunning = true).copy(fullAccessConfirmation = confirmation))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+        composeRule.onNodeWithText("仅对任务 thread-a", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("下个 turn", substring = true).assertIsDisplayed()
+        composeRule.onAllNodesWithText("确认完全访问")[1].performClick()
+        composeRule.runOnIdle { assertEquals(confirmation, callbacks.confirmation) }
+    }
+
+    @Test fun cachedTaskDraftRestoresAndComposerCallbackCarriesExactSelectionEpoch() {
+        val state = mutableStateOf(baseState().copy(taskSelectionEpoch = 7, composer = TaskComposer("draft A", 7)))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+        assertEquals("draft A", composerText())
+        composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput(" edited")
+        composeRule.runOnIdle {
+            assertEquals("thread-a", callbacks.composerOwner)
+            assertEquals(7L, callbacks.composerEpoch)
+            assertEquals("draft A edited", callbacks.composer!!.text)
+            state.value = state.value.copy(selectedThreadId = "thread-b", taskSelectionEpoch = 8,
+                composer = TaskComposer("draft B", 7))
+        }
+        assertEquals("draft B", composerText())
+    }
+
+    @Test fun sidebarShowsRunningApprovalFailedAndUnreadIndicators() {
+        val state = mutableStateOf(baseState().copy(taskIndicators = mapOf("thread-a" to TaskIndicator(true, true, true, 2))))
+        show(state)
+        if (composeRule.onAllNodesWithText("Running · Approval · Failed · Unread 2").fetchSemanticsNodes().isEmpty() &&
+            composeRule.onAllNodesWithText("demo").fetchSemanticsNodes().isEmpty()) {
+            composeRule.onNodeWithContentDescription("打开会话").performClick()
+        }
+        if (composeRule.onAllNodesWithText("Running · Approval · Failed · Unread 2").fetchSemanticsNodes().isEmpty()) {
+            composeRule.onNodeWithTag("sidebar-project-/workspace/demo").performClick()
+        }
+        composeRule.onNodeWithText("Running · Approval · Failed · Unread 2").assertIsDisplayed()
+    }
+
+    @Test fun unconfirmedPhoneMessageRemainsDistinctFromSameDesktopText() {
+        show(mutableStateOf(baseState(timeline = listOf(
+            TimelineItem("local-phone", TimelineKind.USER, body = "same text", clientId = "local-phone", status = "awaiting confirmation"),
+            TimelineItem("desktop-message", TimelineKind.USER, body = "same text", clientId = "desktop-client", turnId = "t"),
+        ))))
+        composeRule.onAllNodesWithText("same text").assertCountEquals(2)
+        composeRule.onNodeWithText("等待远端消息确认").assertIsDisplayed()
+    }
+
     private fun scrollTo(tag: String) {
         composeRule.onNodeWithTag(CONVERSATION_LIST).performScrollToNode(hasTestTag(tag))
         composeRule.onNodeWithTag(tag).assertIsDisplayed()
@@ -559,6 +613,8 @@ val answer = 42
                     onSetCollaborationMode = { callbacks.collaborationMode = it },
                     onSetPermissionProfile = {},
                     onSetPermissionMode = { callbacks.permissionMode = it },
+                    onUpdateComposer = { owner, epoch, composer -> callbacks.composerOwner = owner; callbacks.composerEpoch = epoch; callbacks.composer = composer },
+                    onConfirmFullAccess = { callbacks.confirmation = it },
                     onLoadRemoteDirectory = {},
                     onClearRemoteDirectory = {},
                     onStartLogin = {},
@@ -643,6 +699,10 @@ class RemoteStateDeviceTest {
 }
 
 private class WorkspaceCallbacks {
+    var confirmation: FullAccessConfirmation? = null
+    var composerOwner: String? = null
+    var composerEpoch: Long? = null
+    var composer: TaskComposer? = null
     var onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit = { _, _, _ -> }
     var onRetryThreads: () -> Unit = {}
     var collaborationMode: String? = null
